@@ -116,4 +116,16 @@ describe("backgroundByDefault", () => {
     expect(outs).toHaveLength(6);
     for (const out of outs) expect(out).not.toContain("queued");
   });
+
+  it("forwards explicit hard_limit to the runner", async () => {
+    const { pi, tools } = makePi();
+    subagentsExtension(pi);
+    settled("DONE");
+
+    await spawn(tools, { hard_limit: true });
+
+    expect(vi.mocked(runAgent).mock.calls.at(-1)?.[3]).toEqual(
+      expect.objectContaining({ hardLimit: true }),
+    );
+  });
 });

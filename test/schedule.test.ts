@@ -334,11 +334,12 @@ describe("SubagentScheduler — fire path", () => {
     scheduler.addJob({
       name: "every-1s", description: "x", schedule: "1s",
       subagent_type: "general-purpose", prompt: "x",
-      thinking: "high", max_turns: 12, isolated: true,
+      thinking: "high", max_turns: 12, hard_limit: true, isolated: true,
     });
 
     vi.advanceTimersByTime(1_000);
     const optsArg = manager.spawn.mock.calls[0][4];
+    expect(optsArg.hardLimit).toBe(true);
     expect(optsArg.invocation).toEqual({
       thinking: "high",
       maxTurns: 12,

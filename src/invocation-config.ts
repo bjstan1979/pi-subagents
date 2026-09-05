@@ -58,6 +58,7 @@ interface AgentInvocationParams {
   model?: string;
   thinking?: string;
   max_turns?: number;
+  hard_limit?: boolean;
   run_in_background?: boolean;
   inherit_context?: boolean;
   isolated?: boolean;
@@ -102,6 +103,7 @@ export function resolveAgentInvocationConfig(
   modelFromParams: boolean;
   thinking?: ThinkingLevel;
   maxTurns?: number;
+  hardLimit: boolean;
   inheritContext: boolean;
   runInBackground: boolean;
   isolated: boolean;
@@ -137,6 +139,7 @@ export function resolveAgentInvocationConfig(
     modelFromParams: agentConfig?.model == null && params.model != null,
     thinking: (agentConfig?.thinking ?? params.thinking) as ThinkingLevel | undefined,
     maxTurns: agentConfig?.maxTurns ?? params.max_turns,
+    hardLimit: agentConfig?.hardLimit ?? params.hard_limit ?? false,
     inheritContext: agentConfig?.inheritContext ?? params.inherit_context ?? false,
     runInBackground: agentConfig?.runInBackground ?? params.run_in_background ?? opts?.defaultRunInBackground ?? false,
     isolated: agentConfig?.isolated ?? params.isolated ?? false,

@@ -2728,8 +2728,26 @@ describe("agent-runner turn limits", () => {
     const { session, result } = await runWithTurns(5, { maxTurns: 5 });
     expect(session.steer).toHaveBeenCalledTimes(1);
     expect(session.steer.mock.calls[0][0]).toContain("turn limit");
+    expect(session.setActiveToolsByName).not.toHaveBeenCalledWith([]);
     expect(session.abort).not.toHaveBeenCalled();
     expect(result.steered).toBe(true);
+  });
+
+  it("disables tools immediately at the limit when hardLimit is explicit", async () => {
+    const { session, result } = await runWithTurns(5, { maxTurns: 5, hardLimit: true });
+    expect(session.setActiveToolsByName).toHaveBeenCalledWith([]);
+    expect(session.getActiveToolNames()).toEqual([]);
+    expect(session.steer).toHaveBeenCalledTimes(1);
+    expect(session.steer.mock.calls[0][0]).toContain("HARD LIMIT");
+    expect(session.abort).not.toHaveBeenCalled();
+    expect(result.steered).toBe(true);
+  });
+
+  it("keeps the hard-limit final-answer phase tool-free", async () => {
+    const { session } = await runWithTurns(7, { maxTurns: 5, hardLimit: true });
+    expect(session.setActiveToolsByName.mock.calls.filter(([names]) => names.length === 0)).toHaveLength(3);
+    expect(session.getActiveToolNames()).toEqual([]);
+    expect(session.abort).not.toHaveBeenCalled();
   });
 
   it("does not re-steer on every turn once the soft limit latched", async () => {

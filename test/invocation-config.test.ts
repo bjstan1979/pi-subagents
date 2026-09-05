@@ -25,6 +25,7 @@ describe("resolveAgentInvocationConfig", () => {
         model: "provider/config-model",
         thinking: "high",
         maxTurns: 42,
+        hardLimit: true,
         inheritContext: false,
         runInBackground: false,
         isolated: false,
@@ -34,6 +35,7 @@ describe("resolveAgentInvocationConfig", () => {
         model: "provider/param-model",
         thinking: "minimal",
         max_turns: 1,
+        hard_limit: false,
         inherit_context: true,
         run_in_background: true,
         isolated: true,
@@ -45,6 +47,7 @@ describe("resolveAgentInvocationConfig", () => {
     expect(resolved.modelFromParams).toBe(false);
     expect(resolved.thinking).toBe("high");
     expect(resolved.maxTurns).toBe(42);
+    expect(resolved.hardLimit).toBe(true);
     expect(resolved.inheritContext).toBe(false);
     expect(resolved.runInBackground).toBe(false);
     expect(resolved.isolated).toBe(false);
@@ -56,6 +59,7 @@ describe("resolveAgentInvocationConfig", () => {
       model: "provider/param-model",
       thinking: "minimal",
       max_turns: 3,
+      hard_limit: true,
       inherit_context: true,
       run_in_background: true,
       isolated: true,
@@ -66,6 +70,7 @@ describe("resolveAgentInvocationConfig", () => {
     expect(resolved.modelFromParams).toBe(true);
     expect(resolved.thinking).toBe("minimal");
     expect(resolved.maxTurns).toBe(3);
+    expect(resolved.hardLimit).toBe(true);
     expect(resolved.inheritContext).toBe(true);
     expect(resolved.runInBackground).toBe(true);
     expect(resolved.isolated).toBe(true);
@@ -104,6 +109,7 @@ describe("resolveAgentInvocationConfig", () => {
     expect(resolved.inheritContext).toBe(false);
     expect(resolved.runInBackground).toBe(false);
     expect(resolved.isolated).toBe(false);
+    expect(resolved.hardLimit).toBe(false);
   });
 
   // "off" exists so a model that cannot bring itself to omit an optional field

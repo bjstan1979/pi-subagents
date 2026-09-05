@@ -456,6 +456,8 @@ export interface RunOptions {
   agentId?: string;
   model?: Model<any>;
   maxTurns?: number;
+  /** Opt in to a hard tool ceiling at maxTurns; omitted keeps graceful soft-limit behavior. */
+  hardLimit?: boolean;
   signal?: AbortSignal;
   /** Applies only when the agent file leaves `isolated:` unset — frontmatter is authoritative. */
   isolated?: boolean;
@@ -1143,10 +1145,12 @@ export async function runAgent(
 
   options.onSessionCreated?.(session);
 
-  // Track turns for graceful max_turns enforcement
+  // max_turns is graceful by default. hardLimit removes tools at the ceiling,
+  // leaving the model one tool-free turn to return its final answer.
   let turnCount = 0;
   const maxTurns = resolveEffectiveMaxTurns(type, options.maxTurns);
-  let softLimitReached = false;
+  const hardLimit = options.hardLimit ?? agentConfig?.hardLimit ?? false;
+  let limitReached = false;
   let aborted = false;
 
   let currentMessageText = "";
@@ -1155,10 +1159,19 @@ export async function runAgent(
       turnCount++;
       options.onTurnEnd?.(turnCount);
       if (maxTurns != null) {
-        if (!softLimitReached && turnCount >= maxTurns) {
-          softLimitReached = true;
-          session.steer("You have reached your turn limit. Wrap up immediately — provide your final answer now.");
-        } else if (softLimitReached && turnCount >= maxTurns + graceTurns) {
+        if (!limitReached && turnCount >= maxTurns) {
+          limitReached = true;
+          if (hardLimit) {
+            session.setActiveToolsByName([]);
+            session.steer("HARD LIMIT: Tools disabled. Return your final answer now without calling tools.");
+          } else {
+            session.steer("You have reached your turn limit. Wrap up immediately — provide your final answer now.");
+          }
+        } else if (hardLimit && limitReached) {
+          // Extension scope listeners may re-activate tools at turn_end. Keep the
+          // final-answer phase tool-free if the model emits another agentic turn.
+          session.setActiveToolsByName([]);
+        } else if (limitReached && turnCount >= maxTurns + graceTurns) {
           aborted = true;
           session.abort();
         }
@@ -1243,7 +1256,7 @@ export async function runAgent(
     responseText,
     session,
     aborted,
-    steered: softLimitReached,
+    steered: limitReached,
     failure: finalTurnError(session, startLen) ?? structuredFailure,
     ...(structuredCapture?.json !== undefined ? { structuredJson: structuredCapture.json } : {}),
     ...(structuredRetried ? { structuredRetried } : {}),

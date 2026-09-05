@@ -193,6 +193,7 @@ interface SpawnOptions {
   reclaim?: { handle: string; alias?: string };
   model?: Model<any>;
   maxTurns?: number;
+  hardLimit?: boolean;
   isolated?: boolean;
   inheritContext?: boolean;
   thinkingLevel?: ThinkingLevel;
@@ -785,6 +786,7 @@ export class AgentManager {
       agentId: id,
       model: options.model,
       maxTurns: options.maxTurns,
+      hardLimit: options.hardLimit,
       isolated: options.isolated,
       inheritContext: options.inheritContext,
       thinkingLevel: options.thinkingLevel,

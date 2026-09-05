@@ -54,6 +54,8 @@ export interface AgentConfig {
   model?: string;
   thinking?: ThinkingLevel;
   maxTurns?: number;
+  /** Disable all tools at maxTurns and allow only the final answer turn. Default false. */
+  hardLimit?: boolean;
   /** Persist this subagent as a normal pi session instead of keeping it in memory only. */
   persistSession?: boolean;
   /** Write the subagent's .output transcript. Defaults to true; false suppresses only that transcript. */
@@ -374,6 +376,7 @@ export interface ScheduledSubagent {
   model?: string;
   thinking?: ThinkingLevel;
   max_turns?: number;
+  hard_limit?: boolean;
   isolated?: boolean;
   isolation?: IsolationMode;
 

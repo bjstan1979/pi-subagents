@@ -108,6 +108,7 @@ tools: read, grep, find
 model: anthropic/claude-opus-4-6
 thinking: high
 max_turns: 30
+hard_limit: true
 persist_session: true
 output_transcript: false
 session_dir: .seams/pi-sessions/seam-plan-reviewer
@@ -130,6 +131,7 @@ You are a security auditor.`);
     expect(agent.model).toBe("anthropic/claude-opus-4-6");
     expect(agent.thinking).toBe("high");
     expect(agent.maxTurns).toBe(30);
+    expect(agent.hardLimit).toBe(true);
     expect(agent.persistSession).toBe(true);
     expect(agent.outputTranscript).toBe(false);
     expect(agent.sessionDir).toBe(".seams/pi-sessions/seam-plan-reviewer");
@@ -160,6 +162,7 @@ Just a prompt.`);
     expect(agent.model).toBeUndefined();
     expect(agent.thinking).toBeUndefined();
     expect(agent.maxTurns).toBeUndefined();
+    expect(agent.hardLimit).toBeUndefined();
     expect(agent.persistSession).toBeUndefined();
     expect(agent.outputTranscript).toBeUndefined();
     expect(agent.sessionDir).toBeUndefined();

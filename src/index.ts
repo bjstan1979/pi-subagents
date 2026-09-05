@@ -1715,6 +1715,11 @@ Terse command-style prompts produce shallow, generic work.
           minimum: 1,
         }),
       ),
+      hard_limit: Type.Optional(
+        Type.Boolean({
+          description: "Opt in to a hard tool ceiling: at max_turns all tools are disabled and the agent must return its final answer. Default false keeps the graceful soft limit.",
+        }),
+      ),
       run_in_background: Type.Optional(
         Type.Boolean({
           description: "Defaults to true — the agent runs detached, returning its ID immediately, and you are notified on completion. Set false only when your very next action depends on the result; the call then blocks and returns the agent's full output inline.",
@@ -1967,6 +1972,7 @@ Terse command-style prompts produce shallow, generic work.
         return resolvedAsked.provider === model?.provider && resolvedAsked.id === model?.id ? undefined : asked;
       })(resolvedConfig.overridden?.model);
       const effectiveMaxTurns = normalizeMaxTurns(resolvedConfig.maxTurns ?? getDefaultMaxTurns());
+      const hardLimit = resolvedConfig.hardLimit;
       const agentInvocation: AgentInvocation = {
         modelName,
         modelId,
@@ -2052,6 +2058,7 @@ Terse command-style prompts produce shallow, generic work.
             model: params.model as string | undefined,
             thinking: thinking,
             max_turns: effectiveMaxTurns,
+            hard_limit: hardLimit,
             isolated: isolated,
             isolation: isolation,
           });
@@ -2175,6 +2182,7 @@ Terse command-style prompts produce shallow, generic work.
           name: params.name as string | undefined,
           model,
           maxTurns: effectiveMaxTurns,
+          hardLimit,
           isolated,
           inheritContext,
           thinkingLevel: thinking,
@@ -2336,6 +2344,7 @@ Terse command-style prompts produce shallow, generic work.
           name: params.name as string | undefined,
           model,
           maxTurns: effectiveMaxTurns,
+          hardLimit,
           isolated,
           inheritContext,
           thinkingLevel: thinking,
