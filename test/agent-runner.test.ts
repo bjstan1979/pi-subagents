@@ -2702,8 +2702,12 @@ describe("agent-runner turn limits", () => {
    * Run an agent whose prompt fires `turns` synthetic turn_end events before it
    * produces its final message — the same events a real session emits.
    */
-  async function runWithTurns(turns: number, options: Record<string, unknown> = {}) {
-    vi.mocked(getAgentConfig).mockReturnValueOnce(makeAgentConfig());
+  async function runWithTurns(
+    turns: number,
+    options: Record<string, unknown> = {},
+    agent = makeAgentConfig(),
+  ) {
+    vi.mocked(getAgentConfig).mockReturnValueOnce(agent);
     const { session, listeners } = createSession("OK");
     session.prompt.mockImplementation(async () => {
       for (let i = 0; i < turns; i++) {
@@ -2748,6 +2752,16 @@ describe("agent-runner turn limits", () => {
     expect(session.setActiveToolsByName.mock.calls.filter(([names]) => names.length === 0)).toHaveLength(3);
     expect(session.getActiveToolNames()).toEqual([]);
     expect(session.abort).not.toHaveBeenCalled();
+  });
+
+  it.each([false, true])("preserves a tools:none agent in hardLimit=%s mode", async (hardLimit) => {
+    vi.mocked(getToolNamesForType).mockReturnValueOnce([]);
+    await runWithTurns(
+      1,
+      { maxTurns: 1, hardLimit },
+      makeAgentConfig({ builtinToolNames: [], extensions: false }),
+    );
+    expect(lastToolsPassed()).toEqual([]);
   });
 
   it("does not re-steer on every turn once the soft limit latched", async () => {
