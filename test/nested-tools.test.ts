@@ -222,6 +222,21 @@ describe("child-safe nested Agent tools", () => {
     expect(record.pendingSteers).toEqual(["focus on tests"]);
   });
 
+  it("queues a steer for an owned queued child whose session is not ready yet", async () => {
+    const [, , steer] = tools();
+    const record: Record<string, unknown> = {
+      id: "child-1",
+      status: "queued",
+      parentAgentId: "parent-1",
+    };
+    records.set("child-1", record);
+
+    const result = await execute(steer, { agent_id: "child-1", message: "focus on tests" });
+
+    expect(result.isError).toBe(false);
+    expect(record.pendingSteers).toEqual(["focus on tests"]);
+  });
+
   it("blocks delegation at the inherited depth cap", async () => {
     const [agent] = tools("all", 2, 2);
     const result = await execute(agent, {

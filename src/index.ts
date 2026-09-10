@@ -2991,12 +2991,12 @@ Terse command-style prompts produce shallow, generic work.
     name: SUBAGENT_TOOL_NAMES.STEER,
     label: "Steer Agent",
     description:
-      "Send a steering message to a running agent. The message will interrupt the agent after its current tool execution " +
-      "and be injected into its conversation, allowing you to redirect its work mid-run. Only works on running agents.",
+      "Send a steering message to a running or queued agent. The message will interrupt the agent after its current tool execution " +
+      "and be injected into its conversation, allowing you to redirect its work mid-run. If the agent is queued or initializing, the message is delivered once its session starts.",
     promptSnippet: "Send a steering message to redirect a running background agent",
     parameters: Type.Object({
       agent_id: Type.String({
-        description: "The agent ID to steer (must be currently running). The agent's handle also works — its `name` if you gave it one, otherwise its type (`explore`, `explore-2`).",
+        description: "The agent ID to steer (must be currently running or queued). The agent's handle also works — its `name` if you gave it one, otherwise its type (`explore`, `explore-2`).",
       }),
       message: Type.String({
         description: "The steering message to send. This will appear as a user message in the agent's conversation.",
@@ -3007,7 +3007,7 @@ Terse command-style prompts produce shallow, generic work.
       if (!record || !isTopLevelAgent(record)) {
         return textResult(`Agent not found: "${params.agent_id}". It may have been cleaned up.`);
       }
-      if (record.status !== "running") {
+      if (record.status !== "running" && record.status !== "queued") {
         return textResult(`Agent "${params.agent_id}" is not running (status: ${record.status}). Cannot steer a non-running agent.`);
       }
       if (!record.session) {

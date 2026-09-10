@@ -126,6 +126,34 @@ describe("steer_subagent before the session exists", () => {
 
     await lifecycle.get("session_shutdown")?.();
   });
+
+  it("queues the message for a queued agent and says so", async () => {
+    const { pi, tools, lifecycle } = makePi();
+    subagentsExtension(pi);
+    heldRun();
+
+    let queuedId: string | undefined;
+    for (let i = 0; i < 20 && !queuedId; i++) {
+      const r = await tools.get("Agent").execute(
+        "tc-spawn",
+        { prompt: "go", description: "queued steer test", subagent_type: "general-purpose", run_in_background: true },
+        undefined,
+        undefined,
+        ctx(),
+      );
+      const id = /Agent ID: (\S+)/.exec(textOf(r))![1];
+      if (textOf(r).includes("queued in background")) {
+        queuedId = id;
+      }
+    }
+    expect(queuedId).toBeDefined();
+
+    const result = await steer(tools, queuedId!, "redirect queued");
+    expect(textOf(result)).toContain("queued");
+    expect(pi.events.emit).toHaveBeenCalledWith("subagents:steered", { id: queuedId, message: "redirect queued" });
+
+    await lifecycle.get("session_shutdown")?.();
+  });
 });
 
 describe("steer_subagent once the session exists", () => {

@@ -490,6 +490,16 @@ describe("Tool Loop Guard & Universal Session Controller", () => {
     const callResume = { toolCall: { id: "c4", name: "bash", arguments: { command: "npm test" } } };
     const resResume = await session.agent.beforeToolCall(callResume);
     expect(resResume).toBeUndefined();
+
+    // Resume must also reset escalation history: after two new failures, the
+    // first new block warns but does not terminate immediately.
+    session._emit({ type: "tool_execution_end", toolCallId: "c4", toolName: "bash", args: { command: "npm test" }, isError: true });
+    session._emit({ type: "turn_end" });
+    session._emit({ type: "tool_execution_end", toolCallId: "c5", toolName: "bash", args: { command: "npm test" }, isError: true });
+    session._emit({ type: "turn_end" });
+    const reblocked = await session.agent.beforeToolCall({ toolCall: { id: "c6", name: "bash", arguments: { command: "npm test" } } });
+    expect(reblocked?.block).toBe(true);
+    expect(reblocked?.terminate).toBeUndefined();
   });
 
   it("recognizes powershell as a modifying tool", async () => {
@@ -869,5 +879,143 @@ describe("Tool Loop Guard & Universal Session Controller", () => {
     // Turn 4: grep in project root . is now ALLOWED
     const resGrepAllowed = await session.agent.beforeToolCall(callGrepProj);
     expect(resGrepAllowed).toBeUndefined();
+  });
+
+  it("permits recovery re-read on target file after failed edit or modification, while blocking secondary read loops", async () => {
+    const { session } = createStubSession();
+    installSessionToolController(session);
+
+    // Turn 1: initial read of target file
+    session._emit({ type: "tool_execution_start", toolCallId: "r1", toolName: "read", args: { path: "src/auth.ts" } });
+    session._emit({ type: "tool_execution_end", toolCallId: "r1", toolName: "read", args: { path: "src/auth.ts" }, isError: false });
+    session._emit({ type: "turn_end" });
+
+    // Turn 2: edit on target file fails (e.g. stale anchor or unserved range)
+    session._emit({ type: "tool_execution_start", toolCallId: "e1", toolName: "edit", args: { path: "src/auth.ts", edits: [] } });
+    session._emit({ type: "tool_execution_end", toolCallId: "e1", toolName: "edit", args: { path: "src/auth.ts", edits: [] }, isError: true });
+    session._emit({ type: "turn_end" });
+
+    // Turn 3: recovery re-read on src/auth.ts must be PERMITTED (deadlock broken)
+    const recoveryRead = { toolCall: { id: "r2", name: "read", arguments: { path: "src/auth.ts" } } };
+    const resRecovery = await session.agent.beforeToolCall(recoveryRead);
+    expect(resRecovery).toBeUndefined();
+
+    // Recovery read completes
+    session._emit({ type: "tool_execution_start", toolCallId: "r2", toolName: "read", args: { path: "src/auth.ts" } });
+    session._emit({ type: "tool_execution_end", toolCallId: "r2", toolName: "read", args: { path: "src/auth.ts" }, isError: false });
+    session._emit({ type: "turn_end" });
+
+    // Turn 4: secondary identical read without intervening modification must be BLOCKED
+    const secondaryRead = { toolCall: { id: "r3", name: "read", arguments: { path: "src/auth.ts" } } };
+    const resSecondary = await session.agent.beforeToolCall(secondaryRead);
+    expect(resSecondary?.block).toBe(true);
+    expect(resSecondary?.reason).toMatch(/already executed in the preceding turn/);
+  });
+
+  it("escalates repeated blocked tool invocations to terminate: true to prevent infinite turn-exhaustion loops", async () => {
+    const { session } = createStubSession();
+    installSessionToolController(session);
+
+    // Fail 2 consecutive times
+    for (let i = 0; i < 2; i++) {
+      session._emit({ type: "tool_execution_start", toolCallId: `c${i}`, toolName: "bash", args: { command: "failing_cmd" } });
+      session._emit({ type: "tool_execution_end", toolCallId: `c${i}`, toolName: "bash", args: { command: "failing_cmd" }, isError: true });
+      session._emit({ type: "turn_end" });
+    }
+
+    // Call 3: 1st block warns model to change arguments (terminate is undefined)
+    const call3 = { toolCall: { id: "c3", name: "bash", arguments: { command: "failing_cmd" } } };
+    const res3 = await session.agent.beforeToolCall(call3);
+    expect(res3?.block).toBe(true);
+    expect(res3?.terminate).toBeUndefined();
+    session._emit({ type: "tool_execution_start", toolCallId: "c3", toolName: "bash", args: { command: "failing_cmd" } });
+    session._emit({ type: "tool_execution_end", toolCallId: "c3", toolName: "bash", args: { command: "failing_cmd" }, isError: false });
+    session._emit({ type: "turn_end" });
+
+    // Call 4: obstinate model sends identical call again -> escalates to terminate: true
+    const call4 = { toolCall: { id: "c4", name: "bash", arguments: { command: "failing_cmd" } } };
+    const res4 = await session.agent.beforeToolCall(call4);
+    expect(res4?.block).toBe(true);
+    expect(res4?.terminate).toBe(true);
+    expect(res4?.reason).toMatch(/Terminating to prevent infinite loop turn exhaustion/);
+  });
+
+  it("decouples consecutive failure clearance: code edits clear test failures but unrelated file writes do not", async () => {
+    const { session } = createStubSession();
+    installSessionToolController(session);
+
+    // bash('npm test') fails twice
+    for (let i = 0; i < 2; i++) {
+      session._emit({ type: "tool_execution_start", toolCallId: `t${i}`, toolName: "bash", args: { command: "npm test" } });
+      session._emit({ type: "tool_execution_end", toolCallId: `t${i}`, toolName: "bash", args: { command: "npm test" }, isError: true });
+      session._emit({ type: "turn_end" });
+    }
+
+    // Unrelated write to log.txt succeeds
+    session._emit({ type: "tool_execution_start", toolCallId: "w1", toolName: "write", args: { path: "log.txt", content: "ok" } });
+    session._emit({ type: "tool_execution_end", toolCallId: "w1", toolName: "write", args: { path: "log.txt", content: "ok" }, isError: false });
+    session._emit({ type: "turn_end" });
+
+    // npm test must remain BLOCKED (writing log.txt does not evade test loop guard)
+    const testCallBlocked = { toolCall: { id: "t3", name: "bash", arguments: { command: "npm test" } } };
+    const resBlocked = await session.agent.beforeToolCall(testCallBlocked);
+    expect(resBlocked?.block).toBe(true);
+
+    // Now edit code file src/app.ts
+    session._emit({ type: "tool_execution_start", toolCallId: "e1", toolName: "edit", args: { path: "src/app.ts", edits: [] } });
+    session._emit({ type: "tool_execution_end", toolCallId: "e1", toolName: "edit", args: { path: "src/app.ts", edits: [] }, isError: false });
+    session._emit({ type: "turn_end" });
+
+    // Now npm test is PERMITTED to verify fix
+    const testCallAllowed = { toolCall: { id: "t4", name: "bash", arguments: { command: "npm test" } } };
+    const resAllowed = await session.agent.beforeToolCall(testCallAllowed);
+    expect(resAllowed).toBeUndefined();
+  });
+
+
+  it("keeps get_subagent_result outside duplicate-call caching across turns", async () => {
+    const { session } = createStubSession();
+    installSessionToolController(session);
+
+    const args = { agent_id: "agent_alpha", wait: false };
+    session._emit({ type: "tool_execution_start", toolCallId: "p1", toolName: "get_subagent_result", args });
+    session._emit({ type: "tool_execution_end", toolCallId: "p1", toolName: "get_subagent_result", args, isError: false });
+    session._emit({ type: "turn_end" });
+
+    const pollAgain = await session.agent.beforeToolCall({
+      toolCall: { id: "p2", name: "get_subagent_result", arguments: args },
+    });
+    expect(pollAgain).toBeUndefined();
+  });
+
+  it("handles undefined and null argument properties without breaking JSON serialization or recovery read cache", async () => {
+    const { session } = createStubSession();
+    installSessionToolController(session);
+
+    // Turn 1: read with explicit undefined property
+    session._emit({ type: "tool_execution_start", toolCallId: "r1", toolName: "read", args: { path: "src/auth.ts", offset: undefined, limit: null } });
+    session._emit({ type: "tool_execution_end", toolCallId: "r1", toolName: "read", args: { path: "src/auth.ts", offset: undefined, limit: null }, isError: false });
+    session._emit({ type: "turn_end" });
+
+    // Turn 2: edit fails (stale anchor)
+    session._emit({ type: "tool_execution_start", toolCallId: "e1", toolName: "edit", args: { path: "src/auth.ts", edits: [] } });
+    session._emit({ type: "tool_execution_end", toolCallId: "e1", toolName: "edit", args: { path: "src/auth.ts", edits: [] }, isError: true });
+    session._emit({ type: "turn_end" });
+
+    // Turn 3: recovery re-read with undefined property is PERMITTED (invalidated by target path)
+    const recoveryCall = { toolCall: { id: "r2", name: "read", arguments: { path: "src/auth.ts", offset: undefined } } };
+    const resRecovery = await session.agent.beforeToolCall(recoveryCall);
+    expect(resRecovery).toBeUndefined();
+
+    // Complete recovery read
+    session._emit({ type: "tool_execution_start", toolCallId: "r2", toolName: "read", args: { path: "src/auth.ts", offset: undefined } });
+    session._emit({ type: "tool_execution_end", toolCallId: "r2", toolName: "read", args: { path: "src/auth.ts", offset: undefined }, isError: false });
+    session._emit({ type: "turn_end" });
+
+    // Turn 4: secondary read without intervening modification is BLOCKED
+    const secondaryCall = { toolCall: { id: "r3", name: "read", arguments: { path: "src/auth.ts", offset: undefined } } };
+    const resSecondary = await session.agent.beforeToolCall(secondaryCall);
+    expect(resSecondary?.block).toBe(true);
+    expect(resSecondary?.reason).toMatch(/already executed in the preceding turn/);
   });
 });

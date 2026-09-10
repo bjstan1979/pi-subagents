@@ -412,14 +412,14 @@ export function createNestedSubagentTools(context: NestedToolContext): ToolDefin
   const steerTool = defineTool({
     name: NESTED_TOOL_NAMES[2],
     label: "Steer Nested Agent",
-    description: "Send guidance to a running nested agent owned by this parent.",
+    description: "Send guidance to a running or queued nested agent owned by this parent.",
     parameters: Type.Object({
       agent_id: Type.String(),
       message: Type.String(),
     }),
     execute: async (_toolCallId, params) => {
       const record = context.manager.getRecord(params.agent_id);
-      if (!ownsRecord(record, context.parentAgentId) || record.status !== "running") {
+      if (!ownsRecord(record, context.parentAgentId) || (record.status !== "running" && record.status !== "queued")) {
         return textResult(`Running nested agent not found or not owned by this parent: "${params.agent_id}".`, true);
       }
       // Session not ready yet — queue the steer. The manager flushes pending

@@ -618,14 +618,19 @@ function isModifyingTool(name: string, args?: unknown): boolean {
   return MODIFYING_TOOL_NAMES.has(name);
 }
 function stableSerialize(value: unknown): string {
-  if (value === undefined || value === null) return "";
-  if (Array.isArray(value)) return `[${value.map(stableSerialize).join(",")}]`;
+  if (value === undefined) return "";
+  if (value === null) return "null";
+  if (Array.isArray(value)) return `[${value.map((v) => (v === undefined ? "null" : stableSerialize(v))).join(",")}]`;
   if (typeof value === "object") {
     try {
       const keys = Object.keys(value as Record<string, unknown>).sort();
-      return `{${keys
-        .map((k) => `${JSON.stringify(k)}:${stableSerialize((value as Record<string, unknown>)[k])}`)
-        .join(",")}}`;
+      const entries: string[] = [];
+      for (const k of keys) {
+        const val = (value as Record<string, unknown>)[k];
+        if (val === undefined) continue;
+        entries.push(`${JSON.stringify(k)}:${stableSerialize(val)}`);
+      }
+      return `{${entries.join(",")}}`;
     } catch {
       return String(value);
     }
@@ -758,8 +763,62 @@ export function isKeyInvalidatedByTarget(
   return false;
 }
 
+const CODE_OR_TEST_FILE_EXTENSIONS = new Set([
+  ".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs",
+  ".py", ".pyw", ".rs", ".go", ".java", ".c", ".cpp", ".cc", ".cxx", ".h", ".hpp",
+  ".rb", ".php", ".cs", ".swift", ".kt", ".kts", ".scala", ".sh", ".bash",
+  ".json", ".yaml", ".yml", ".toml", ".xml", ".sql", ".html", ".css", ".scss",
+]);
+
+export function isCodeOrTestPath(filePath: string): boolean {
+  const lower = filePath.toLowerCase();
+  const lastDot = lower.lastIndexOf(".");
+  if (lastDot >= 0 && CODE_OR_TEST_FILE_EXTENSIONS.has(lower.slice(lastDot))) {
+    return true;
+  }
+  const base = lower.split("/").pop() ?? "";
+  if (
+    base === "makefile" ||
+    base === "dockerfile" ||
+    base === "cargo.toml" ||
+    base === "package.json" ||
+    base === "cmakelists.txt"
+  ) {
+    return true;
+  }
+  return /\b(test|tests|spec|src)\b/.test(lower);
+}
+
+function clearScopedConsecutiveFailures(loopState: LoopGuardState, targetPath: string): void {
+  const clearsShellVerification = isCodeOrTestPath(targetPath);
+  for (const [key] of loopState.consecutiveFailures) {
+    const colonIdx = key.indexOf(":");
+    if (colonIdx < 0) continue;
+    const failedTool = key.slice(0, colonIdx);
+    let failedArgs: any = null;
+    try {
+      failedArgs = JSON.parse(key.slice(colonIdx + 1));
+    } catch {}
+
+    const failedTarget = getTargetFilePath(failedTool, failedArgs);
+    if (failedTarget !== undefined) {
+      if (failedTarget === targetPath) {
+        loopState.consecutiveFailures.delete(key);
+        loopState.consecutiveBlocks.delete(key);
+      }
+      continue;
+    }
+
+    if (clearsShellVerification && (failedTool === "bash" || failedTool === "powershell")) {
+      loopState.consecutiveFailures.delete(key);
+      loopState.consecutiveBlocks.delete(key);
+    }
+  }
+}
+
 interface LoopGuardState {
   consecutiveFailures: Map<string, number>;
+  consecutiveBlocks: Map<string, number>;
   readOnlyCalls: Map<string, number>;
   fileMutations: Map<string, number>;
   directoryMutations: Map<string, number>;
@@ -785,6 +844,7 @@ export function installSessionToolController(
   if (!loopState) {
     loopState = {
       consecutiveFailures: new Map(),
+      consecutiveBlocks: new Map(),
       readOnlyCalls: new Map(),
       fileMutations: new Map(),
       directoryMutations: new Map(),
@@ -851,14 +911,20 @@ export function installSessionToolController(
         // Tool Loop Guard: consecutive identical failing tool calls
         const failCount = loopState.consecutiveFailures.get(toolKey) ?? 0;
         if (failCount >= 2) {
+          const blockCount = (loopState.consecutiveBlocks.get(toolKey) ?? 0) + 1;
+          loopState.consecutiveBlocks.set(toolKey, blockCount);
           if (callId) {
             loopState.blockedCalls.add(callId);
           } else {
             loopState.blockedToolKeys.add(toolKey);
           }
+          const shouldTerminate = blockCount >= 2;
           return {
             block: true,
-            reason: `Tool "${toolName}" with identical arguments has failed consecutively (${failCount} times) with no intervening modifications. Repeatedly executing the identical failing call without changing arguments or fixing preconditions is blocked to prevent an unrecoverable loop. Modify your arguments or try an alternative approach.`,
+            reason: shouldTerminate
+              ? `Tool "${toolName}" with identical arguments has failed consecutively (${failCount} times) and been blocked repeatedly (${blockCount} times) with no changes. Terminating to prevent infinite loop turn exhaustion.`
+              : `Tool "${toolName}" with identical arguments has failed consecutively (${failCount} times) with no intervening modifications. Repeatedly executing the identical failing call without changing arguments or fixing preconditions is blocked to prevent an unrecoverable loop. Modify your arguments or try an alternative approach.`,
+            ...(shouldTerminate ? { terminate: true } : {}),
           };
         }
 
@@ -937,11 +1003,21 @@ export function installSessionToolController(
         if (event.isError) {
           const count = loopState.consecutiveFailures.get(toolKey) ?? 0;
           loopState.consecutiveFailures.set(toolKey, count + 1);
+          if (isModifyingTool(toolName, toolArgs)) {
+            const targetPath = getTargetFilePath(toolName, toolArgs);
+            if (targetPath !== undefined) {
+              for (const [key] of loopState.readOnlyCalls) {
+                if (isKeyInvalidatedByTarget(key, targetPath, toolName)) {
+                  loopState.readOnlyCalls.delete(key);
+                }
+              }
+            }
+          }
         } else {
           loopState.consecutiveFailures.delete(toolKey);
+          loopState.consecutiveBlocks.delete(toolKey);
           if (isModifyingTool(toolName, toolArgs)) {
             loopState.lastMutatingTurn = loopState.currentTurn;
-            loopState.consecutiveFailures.clear();
             const targetPath = getTargetFilePath(toolName, toolArgs);
             if (targetPath !== undefined) {
               loopState.fileMutations.set(targetPath, loopState.currentTurn);
@@ -953,10 +1029,13 @@ export function installSessionToolController(
                   loopState.readOnlyCalls.delete(key);
                 }
               }
+              clearScopedConsecutiveFailures(loopState, targetPath);
             } else {
               loopState.lastWorkspaceMutationTurn = loopState.currentTurn;
               loopState.fileMutations.clear();
               loopState.directoryMutations.clear();
+              loopState.consecutiveFailures.clear();
+              loopState.consecutiveBlocks.clear();
               for (const [key] of loopState.readOnlyCalls) {
                 if (
                   !key.startsWith("read_skill:") &&
@@ -2116,6 +2195,7 @@ export async function resumeAgent(
   const loopState = sessionLoopGuardStates.get(session);
   if (loopState) {
     loopState.consecutiveFailures.clear();
+    loopState.consecutiveBlocks.clear();
     loopState.pendingCalls.clear();
     loopState.blockedCalls.clear();
     loopState.blockedToolKeys.clear();
