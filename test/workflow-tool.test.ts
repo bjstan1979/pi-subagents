@@ -55,6 +55,7 @@ interface StubManager {
   spawnAndWait: ReturnType<typeof vi.fn>;
   abort: ReturnType<typeof vi.fn>;
   resume: ReturnType<typeof vi.fn>;
+  getRecord: ReturnType<typeof vi.fn>;
 }
 
 /** A manager that spawns nothing; `settle` decides what each spawn produces. */
@@ -63,14 +64,17 @@ function stubManager(
 ): StubManager {
   const abort = vi.fn();
   const resume = vi.fn(async () => record({ id: "agent-1", result: "resumed" }));
+  let spawnedRecord: AgentRecord | undefined;
+  const getRecord = vi.fn((id: string) => spawnedRecord?.id === id ? spawnedRecord : undefined);
   const spawnAndWait = vi.fn(
     async (_pi: any, _ctx: any, type: string, prompt: string, options: any, onSpawned?: (id: string) => void) => {
       const settled = await settle(type, prompt, options);
+      spawnedRecord = settled;
       onSpawned?.(settled.id);
       return { id: settled.id, record: settled };
     },
   );
-  return { manager: { spawnAndWait, abort, resume } as unknown as AgentManager, spawnAndWait, abort, resume };
+  return { manager: { spawnAndWait, abort, resume, getRecord } as unknown as AgentManager, spawnAndWait, abort, resume, getRecord };
 }
 
 const request = (overrides: Partial<WorkflowSpawnRequest> = {}): WorkflowSpawnRequest => ({
@@ -141,6 +145,15 @@ describe("createWorkflowHost — spawn mapping", () => {
     expect(options.rootSessionId).toBe("root-1");
   });
 
+  it("passes maxTurns and hardLimit to the manager spawn", async () => {
+    const stub = stubManager();
+    const host = createWorkflowHost({ pi: {} as any, ctx: ctx(), manager: stub.manager });
+
+    await host.spawnAgent(request({ maxTurns: 15, hardLimit: true }));
+    const [, , , , options] = stub.spawnAndWait.mock.calls[0];
+    expect(options.maxTurns).toBe(15);
+    expect(options.hardLimit).toBe(true);
+  });
   it("routes an unknown agent type through the same dispatch the Agent tool uses", async () => {
     // Not a second resolution path: `resolveSpawnType` owns the fallback policy,
     // so an unknown type falls back here exactly as it does for a tool call…
@@ -550,6 +563,31 @@ describe("createWorkflowHost — abort, resume and gate", () => {
 
     expect(resumed?.ok).toBe(false);
     expect(stub.resume).not.toHaveBeenCalled();
+  });
+
+  it("explains that an agent is still in flight when resume fails due to active run", async () => {
+    const stub = stubManager(() => record({ id: "manager-id-7", status: "running" }));
+    stub.resume.mockResolvedValueOnce(undefined);
+    const host = createWorkflowHost({ pi: {} as any, ctx: ctx(), manager: stub.manager });
+
+    await host.spawnAgent(request({ agentId: "wf-agent-0" }));
+    const resumed = await host.resumeAgent?.("wf-agent-0", "and now this");
+
+    expect(resumed?.ok).toBe(false);
+    expect(resumed?.error).toContain('Cannot resume "wf-agent-0" — agent is already running.');
+  });
+
+  it("translates a stopped resumed agent into skipped: true", async () => {
+    const stub = stubManager(() => record({ id: "manager-id-7", status: "stopped", error: "Stopped." }));
+    stub.resume.mockResolvedValueOnce(record({ id: "manager-id-7", status: "stopped", error: "Stopped." }));
+    const host = createWorkflowHost({ pi: {} as any, ctx: ctx(), manager: stub.manager });
+
+    await host.spawnAgent(request({ agentId: "wf-agent-0" }));
+    const resumed = await host.resumeAgent?.("wf-agent-0", "and now this");
+
+    expect(resumed?.ok).toBe(false);
+    expect(resumed?.skipped).toBe(true);
+    expect(resumed?.error).toBe("Stopped.");
   });
 
   it("asks the manager for a pre-cleanup hook only when the agent is gated", async () => {

@@ -1,5 +1,5 @@
 import { execSync } from "node:child_process";
-import { mkdtempSync, rmSync } from "node:fs";
+import { existsSync, mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
@@ -28,7 +28,7 @@ function mockPi(): ExtensionAPI {
 describe("detectEnv", () => {
   it("detects git repo in current project", async () => {
     const env = await detectEnv(mockPi(), process.cwd());
-    expect(env.isGitRepo).toBe(true);
+    expect(env.isGitRepo).toBe(existsSync(join(process.cwd(), ".git")));
     expect(env.platform).toBe(process.platform);
   });
 

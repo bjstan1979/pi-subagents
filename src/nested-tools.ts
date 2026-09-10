@@ -90,7 +90,7 @@ export interface NestedAgentManager {
     onSpawned?: (id: string) => void,
   ): Promise<{ id: string; record: AgentRecord }>;
   getRecord(id: string): AgentRecord | undefined;
-  resume(id: string, prompt: string, signal?: AbortSignal): Promise<AgentRecord | undefined>;
+  resume(id: string, prompt: string, signal?: AbortSignal, options?: any): Promise<AgentRecord | undefined>;
 }
 
 export interface NestedToolContext {
@@ -188,7 +188,24 @@ export function createNestedSubagentTools(context: NestedToolContext): ToolDefin
         if (!ownsRecord(existing, context.parentAgentId)) {
           return textResult(`Nested agent not found or not owned by this parent: "${params.resume}".`, true);
         }
-        const resumed = await context.manager.resume(params.resume, params.prompt, signal);
+        if (existing.status === "running" || existing.status === "queued") {
+          return textResult(
+            `Nested agent "${params.resume}" is still ${existing.status} — it can only be resumed once its current run finishes.`,
+            true,
+          );
+        }
+        const resumeOpts = {
+          maxTurns: params.max_turns,
+          hardLimit: params.hard_limit,
+          isBackground: params.run_in_background,
+        };
+        if (params.run_in_background) {
+          const resumed = await context.manager.resume(params.resume, params.prompt, undefined, resumeOpts);
+          return resumed
+            ? textResult(`Nested agent resumed in background. Agent ID: ${params.resume}`)
+            : textResult(`Failed to resume nested agent "${params.resume}".`, true);
+        }
+        const resumed = await context.manager.resume(params.resume, params.prompt, signal, resumeOpts);
         return resumed
           ? textResult(formatRecord(resumed, "inline"), resumed.status === "error")
           : textResult(`Failed to resume nested agent "${params.resume}".`, true);

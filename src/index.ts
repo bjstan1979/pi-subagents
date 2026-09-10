@@ -1371,7 +1371,7 @@ export default function (pi: ExtensionAPI) {
     ctx: ExtensionContext,
     existing: AgentRecord,
     prompt: string,
-    opts: { outputTranscript: boolean; maxTurns?: number; toolCallId?: string },
+    opts: { outputTranscript: boolean; maxTurns?: number; hardLimit?: boolean; toolCallId?: string },
   ): Promise<AgentRecord | undefined> {
     const id = existing.id;
     const joinMode = resolveJoinMode(defaultJoinMode, true);
@@ -1404,6 +1404,9 @@ export default function (pi: ExtensionAPI) {
     // run_in_background in that same turn keep going.
     const record = await manager.resume(id, prompt, undefined, {
       isBackground: true,
+      maxTurns: opts.maxTurns,
+      hardLimit: opts.hardLimit,
+      onTurnEnd: bgCallbacks.onTurnEnd,
       onToolActivity: bgCallbacks.onToolActivity,
       onAssistantUsage: bgCallbacks.onAssistantUsage,
       // Fires when the run actually starts — immediately, or on queue
@@ -2082,6 +2085,14 @@ Terse command-style prompts produce shallow, generic work.
         if (!existing.session) {
           return textResult(`Agent "${params.resume}" has no active session to resume.`);
         }
+        // A detached or foreground resume cannot re-enter an agent that is still
+        // running or queued. Give actionable advice instead of failing generically.
+        if (existing.status === "running" || existing.status === "queued") {
+          return textResult(
+            `Agent "${params.resume}" is still ${existing.status} — it can only be resumed once its current run finishes.\n` +
+            `Use steer_subagent to send it a message mid-run, or get_subagent_result to wait for it.`,
+          );
+        }
 
         // Background resume: detached run that notifies on completion, mirroring
         // a background spawn. Previously run_in_background was silently ignored
@@ -2089,21 +2100,10 @@ Terse command-style prompts produce shallow, generic work.
         // so a resumed agent always blocked the main loop until it finished.
         if (runInBackground) {
           const id = existing.id;
-          // A detached resume hands control back while the record stays
-          // "running", so nothing stops the model from resuming the same agent
-          // again mid-run. manager.resume() refuses that (it would orphan the
-          // live run's abort controller); say why here, where the model can act
-          // on it, instead of letting it read as a generic failure.
-          if (existing.status === "running" || existing.status === "queued") {
-            return textResult(
-              `Agent "${params.resume}" is still ${existing.status} — it can only be resumed once its current run finishes.\n` +
-              `Use steer_subagent to send it a message mid-run, or get_subagent_result to wait for it.`,
-            );
-          }
-
           const record = await startBackgroundResume(ctx, existing, params.prompt, {
             outputTranscript,
             maxTurns: effectiveMaxTurns,
+            hardLimit,
             toolCallId,
           });
           if (!record) {
@@ -2123,7 +2123,10 @@ Terse command-style prompts produce shallow, generic work.
           );
         }
 
-        const record = await manager.resume(params.resume, params.prompt, signal);
+        const record = await manager.resume(params.resume, params.prompt, signal, {
+          maxTurns: effectiveMaxTurns,
+          hardLimit,
+        });
         if (!record) {
           return textResult(`Failed to resume agent "${params.resume}".`);
         }
@@ -2131,6 +2134,18 @@ Terse command-style prompts produce shallow, generic work.
         // resume produced (never the previous turn's answer, #144).
         if (record.status === "error") {
           return textResult(`Agent failed: ${record.error}${partialOutputSuffix(record)}`, buildDetails(detailBaseFor(record), record));
+        }
+        if (record.status === "stopped") {
+          return textResult(
+            `Agent stopped${getForegroundOutcomeNote(record.status)}.\n\n` + (record.result?.trim() || "No output."),
+            buildDetails(detailBaseFor(record), record),
+          );
+        }
+        if (record.status === "aborted" || record.status === "steered") {
+          return textResult(
+            `Agent ${record.status}${getForegroundOutcomeNote(record.status)}.\n\n` + (record.result?.trim() || "No output."),
+            buildDetails(detailBaseFor(record), record),
+          );
         }
         return textResult(
           record.result?.trim() || "No output.",
@@ -3870,7 +3885,7 @@ Write the file using the write tool. Only write the file, nothing else.`;
         }
       } else if (id === "graceTurns") {
         const n = parseInt(value, 10);
-        if (n >= 1) {
+        if (n >= 0) {
           setGraceTurns(n);
           notifyApplied(ctx, `Grace turns set to ${n}`);
         }
@@ -4068,7 +4083,7 @@ Write the file using the write tool. Only write the file, nothing else.`;
             ? "Default max turns (0 = unlimited)"
             : result === "maxSubagentDepth"
               ? "Nested depth (0/1 = nesting off)"
-              : "Grace turns (1+)";
+              : "Grace turns (0+)";
 
       // Loop until user enters a valid integer or cancels (Esc / null).
       // Silently trims whitespace; rejects non-numeric input by re-prompting.

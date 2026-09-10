@@ -84,13 +84,13 @@ describe("setGraceTurns / getGraceTurns", () => {
     expect(getGraceTurns()).toBe(1);
   });
 
-  it("clamps 0 to 1", () => {
+  it("accepts boundary value 0", () => {
     setGraceTurns(0);
-    expect(getGraceTurns()).toBe(1);
+    expect(getGraceTurns()).toBe(0);
   });
 
-  it("clamps negative values to 1", () => {
+  it("clamps negative values to 0", () => {
     setGraceTurns(-5);
-    expect(getGraceTurns()).toBe(1);
+    expect(getGraceTurns()).toBe(0);
   });
 });

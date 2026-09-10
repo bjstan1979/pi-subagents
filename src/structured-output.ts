@@ -110,7 +110,7 @@ export function createStructuredOutputTool(
       // Last valid call wins: a model that calls twice meant the second one.
       capture.json = JSON.stringify(params);
       capture.lastError = undefined;
-      return { content: [{ type: "text", text: "Recorded." }], details: {} };
+      return { content: [{ type: "text", text: "Recorded." }], details: {}, terminate: true };
     },
   }) as ToolDefinition;
 }

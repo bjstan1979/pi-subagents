@@ -105,6 +105,14 @@ describe("the StructuredOutput tool", () => {
     const { tool } = build();
     expect(tool.prepareArguments?.("not json at all")).toBe("not json at all");
   });
+
+  it("sets terminate: true on valid payload to eliminate redundant follow-up LLM rounds", async () => {
+    const { tool, capture } = build();
+    const result = await (tool as any).execute("tc-terminate", { file: "report.json", line: 42 });
+    expect(result.isError).toBeFalsy();
+    expect(result.terminate).toBe(true);
+    expect(capture.json).toBe(JSON.stringify({ file: "report.json", line: 42 }));
+  });
 });
 
 describe("the retry prompt", () => {

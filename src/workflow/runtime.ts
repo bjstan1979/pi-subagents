@@ -118,6 +118,8 @@ export interface WorkflowSpawnRequest {
    * itself — so exactly one execution either way.
    */
   gate?: string;
+  maxTurns?: number;
+  hardLimit?: boolean;
 }
 
 export interface WorkflowSpawnResult {
@@ -205,6 +207,7 @@ export interface WorkflowHost {
      * the row above it shows the one that ran.
      */
     onResolved?: WorkflowSpawnRequest["onResolved"],
+    options?: { maxTurns?: number; hardLimit?: boolean },
   ): Promise<WorkflowSpawnResult>;
   /**
    * Run a `gate` command and report whether it passed.
@@ -444,6 +447,8 @@ interface AgentCallPayload {
   effort?: string;
   /** Raw JSON Schema from `agent({ schema })`, compiled before anything spawns. */
   schema?: unknown;
+  maxTurns?: number;
+  hardLimit?: boolean;
 }
 
 type WorkerMessage =
@@ -1016,7 +1021,10 @@ export async function runWorkflow(options: RunWorkflowOptions): Promise<Workflow
           try {
             result =
               resumed !== undefined && resumeAgent !== undefined
-                ? await resumeAgent(resumed.agentId, payload.prompt, onResolved)
+                ? await resumeAgent(resumed.agentId, payload.prompt, onResolved, {
+                    ...(payload.maxTurns !== undefined ? { maxTurns: payload.maxTurns } : {}),
+                    ...(payload.hardLimit !== undefined ? { hardLimit: payload.hardLimit } : {}),
+                  })
                 : await host.spawnAgent({
                     agentId,
                     index,
@@ -1032,6 +1040,8 @@ export async function runWorkflow(options: RunWorkflowOptions): Promise<Workflow
                     // Offered, not delegated: a host that can run it inside the
                     // child's worktree does, and hands back `result.gate`.
                     ...(payload.gate !== undefined ? { gate: payload.gate } : {}),
+                    ...(payload.maxTurns !== undefined ? { maxTurns: payload.maxTurns } : {}),
+                    ...(payload.hardLimit !== undefined ? { hardLimit: payload.hardLimit } : {}),
                     onResolved,
                   });
             if (result.ok) {

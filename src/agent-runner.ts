@@ -30,7 +30,13 @@ import { buildMemoryBlock, buildReadOnlyMemoryBlock } from "./memory.js";
 import { createNestedSubagentTools, getMaxSubagentDepth, type NestedAgentManager } from "./nested-tools.js";
 import { buildAgentPrompt, type PromptExtras } from "./prompts.js";
 import { preloadSkills } from "./skill-loader.js";
-import { createStructuredCapture, createStructuredOutputTool, structuredRetryPrompt } from "./structured-output.js";
+import {
+  createStructuredCapture,
+  createStructuredOutputTool,
+  STRUCTURED_OUTPUT_TOOL_NAME,
+  type StructuredCapture,
+  structuredRetryPrompt,
+} from "./structured-output.js";
 import type { SubagentType, ThinkingLevel } from "./types.js";
 import type { LifetimeUsage } from "./usage.js";
 import type { CompiledSchema } from "./workflow/json-schema.js";
@@ -234,6 +240,742 @@ export function parseExtSelectors(entries: string[]): {
  * Only meaningful when extensions are loaded — under `noExtensions`/`isolated` the
  * static `allowedToolNames` allowlist already gates the registry itself.
  */
+interface HardLimitController {
+  isHardLimited: () => boolean;
+  hardLimitAllowedTools: () => string[];
+}
+
+const activeHardLimitControllers = new WeakMap<AgentSession, HardLimitController>();
+export const sessionStructuredCaptures = new WeakMap<AgentSession, StructuredCapture>();
+
+const READ_ONLY_TOOL_NAMES = new Set([
+  "read",
+  "read_skill",
+  "grep",
+  "find",
+  "ls",
+  "ast_grep",
+  "web_search",
+  "web_extract",
+]);
+const MODIFYING_TOOL_NAMES = new Set(["write", "edit", "bash", "powershell", "undo_last_edit", "rollback", "ts_morph"]);
+
+const READ_ONLY_SHELL_BINARIES = new Set([
+  "pwd",
+  "ls",
+  "dir",
+  "echo",
+  "printf",
+  "cat",
+  "head",
+  "tail",
+  "more",
+  "less",
+  "grep",
+  "rg",
+  "ag",
+  "ack",
+  "find",
+  "fdfind",
+  "which",
+  "whereis",
+  "type",
+  "file",
+  "stat",
+  "wc",
+  "diff",
+  "cmp",
+  "md5sum",
+  "sha256sum",
+  "sha1sum",
+  "du",
+  "df",
+  "env",
+  "printenv",
+  "uname",
+  "whoami",
+  "id",
+  "hostname",
+  "uptime",
+  "date",
+  "test",
+  "true",
+  "false",
+]);
+
+const READ_ONLY_GIT_SUBCOMMANDS = new Set([
+  "status",
+  "diff",
+  "log",
+  "show",
+  "branch",
+  "rev-parse",
+  "tag",
+  "remote",
+  "describe",
+  "blame",
+  "shortlog",
+  "check-ref-format",
+  "version",
+  "version",
+  "help",
+]);
+
+export function isReadOnlyShellCommand(rawCommand: unknown): boolean {
+  if (typeof rawCommand !== "string") return false;
+  const cmd = rawCommand.trim();
+  if (!cmd) return false;
+
+  if (/(?:^|[^\\])(?:>>?|<(?!\()|\|\s*tee\b)/.test(cmd)) {
+    return false;
+  }
+
+  if (/\b(?:rm|mv|cp|touch|mkdir|chmod|chown|truncate|install|kill|pkill)\b/.test(cmd)) {
+    return false;
+  }
+
+  const segments = cmd.split(/(?:&&|\|\||;|\|)/).map((s) => s.trim()).filter(Boolean);
+  if (segments.length === 0) return false;
+
+  for (const segment of segments) {
+    const tokens = segment.split(/\s+/).filter(Boolean);
+    let binIdx = 0;
+    while (binIdx < tokens.length && /^[A-Za-z_][A-Za-z0-9_]*=/.test(tokens[binIdx])) {
+      binIdx++;
+    }
+    if (binIdx >= tokens.length) return false;
+
+    let bin = tokens[binIdx];
+    const lastSlash = bin.lastIndexOf("/");
+    if (lastSlash >= 0) {
+      bin = bin.slice(lastSlash + 1);
+    }
+    bin = bin.toLowerCase();
+
+    if (
+      bin === "get-childitem" ||
+      bin === "get-content" ||
+      bin === "get-location" ||
+      bin === "get-item" ||
+      bin === "get-command" ||
+      bin === "gci" ||
+      bin === "gc" ||
+      bin === "gl"
+    ) {
+      continue;
+    }
+
+    if (tokens.length === binIdx + 2) {
+      const arg = tokens[binIdx + 1];
+      if (
+        arg === "--version" ||
+        arg === "-v" ||
+        arg === "-V" ||
+        arg === "--help" ||
+        arg === "-h"
+      ) {
+        continue;
+      }
+    }
+
+    if (bin === "git") {
+      let subcmdIdx = binIdx + 1;
+      while (subcmdIdx < tokens.length && tokens[subcmdIdx].startsWith("-")) {
+        subcmdIdx++;
+      }
+      if (subcmdIdx >= tokens.length) {
+        if (
+          tokens
+            .slice(binIdx + 1)
+            .some((t) => t === "--version" || t === "-v" || t === "--help")
+        ) {
+          continue;
+        }
+        return false;
+      }
+      const subcmd = tokens[subcmdIdx].toLowerCase();
+      if (!READ_ONLY_GIT_SUBCOMMANDS.has(subcmd)) {
+        return false;
+      }
+      const subcmdArgs = tokens.slice(subcmdIdx + 1);
+      if (subcmdArgs.some((t) => t.startsWith("--output") || t === "-o")) {
+        return false;
+      }
+      if (subcmd === "branch") {
+        if (
+          subcmdArgs.some(
+            (t) =>
+              t === "-d" ||
+              t === "-D" ||
+              t === "--delete" ||
+              t === "-m" ||
+              t === "-M" ||
+              t === "--move" ||
+              t === "-c" ||
+              t === "-C" ||
+              t === "--copy",
+          )
+        ) {
+          return false;
+        }
+        const nonFlag = subcmdArgs.filter((t) => !t.startsWith("-"));
+        if (nonFlag.length > 0) {
+          return false;
+        }
+      } else if (subcmd === "tag") {
+        if (
+          subcmdArgs.some(
+            (t) =>
+              t === "-d" ||
+              t === "--delete" ||
+              t === "-a" ||
+              t === "-s" ||
+              t === "-u",
+          )
+        ) {
+          return false;
+        }
+        const nonFlag = subcmdArgs.filter((t) => !t.startsWith("-"));
+        if (nonFlag.length > 0) {
+          return false;
+        }
+      } else if (subcmd === "remote") {
+        const subSubCmd = subcmdArgs.find((t) => !t.startsWith("-"))?.toLowerCase();
+        if (subSubCmd && subSubCmd !== "show" && subSubCmd !== "get-url") {
+          return false;
+        }
+      }
+      continue;
+    }
+
+    if (bin === "find" || bin === "fdfind") {
+      const rest = tokens.slice(binIdx + 1);
+      if (
+        rest.some(
+          (t) =>
+            t === "-delete" ||
+            t === "-exec" ||
+            t === "-execdir" ||
+            t === "-ok" ||
+            t === "-okdir",
+        )
+      ) {
+        return false;
+      }
+    }
+
+    if (READ_ONLY_SHELL_BINARIES.has(bin)) {
+      continue;
+    }
+
+    return false;
+  }
+
+  return true;
+}
+
+export function isSubpathOrEqual(childPath: string, parentPath: string): boolean {
+  const normChild = normalizeFilePath(childPath);
+  const normParent = normalizeFilePath(parentPath);
+  if (!normParent || normParent === ".") {
+    return !normChild.startsWith("/");
+  }
+  if (normParent === "/") {
+    return normChild.startsWith("/");
+  }
+  if (normChild === normParent) return true;
+  return normChild.startsWith(`${normParent}/`);
+}
+
+export function getLatestMutationInScope(
+  scopePath: string | undefined,
+  mutations: Map<string, number>,
+): number {
+  const normScope = scopePath ? normalizeFilePath(scopePath) : ".";
+  let maxTurn = -1;
+  for (const [file, turn] of mutations) {
+    if (isSubpathOrEqual(file, normScope) || isSubpathOrEqual(normScope, file)) {
+      if (turn > maxTurn) maxTurn = turn;
+    }
+  }
+  return maxTurn;
+}
+
+export function normalizeFilePath(rawPath: unknown): string {
+  if (typeof rawPath !== "string") return "";
+  let p = rawPath.trim().replace(/\\/g, "/");
+  if (!p) return "";
+  while (p.startsWith("./")) {
+    p = p.slice(2);
+  }
+  const isAbs = p.startsWith("/");
+  const parts = p.split("/");
+  const resolved: string[] = [];
+  for (const part of parts) {
+    if (!part || part === ".") continue;
+    if (part === "..") {
+      if (resolved.length > 0 && resolved[resolved.length - 1] !== "..") {
+        resolved.pop();
+      } else {
+        resolved.push("..");
+      }
+    } else {
+      resolved.push(part);
+    }
+  }
+  const res = resolved.join("/");
+  if (isAbs) {
+    return `/${res}`;
+  }
+  return res || ".";
+}
+
+function normalizeToolArgs(name: string, args: unknown): unknown {
+  if (!args || typeof args !== "object") return args;
+  const obj = args as Record<string, unknown>;
+  if (
+    name === "read" ||
+    name === "read_skill" ||
+    name === "edit" ||
+    name === "write" ||
+    name === "undo_last_edit" ||
+    name === "grep" ||
+    name === "find" ||
+    name === "ls"
+  ) {
+    if (typeof obj.path === "string") {
+      return { ...obj, path: normalizeFilePath(obj.path) };
+    }
+  } else if (name === "ts_morph") {
+    if (typeof obj.filePath === "string") {
+      return { ...obj, filePath: normalizeFilePath(obj.filePath) };
+    }
+  } else if (name === "ast_grep") {
+    if (Array.isArray(obj.paths)) {
+      return {
+        ...obj,
+        paths: obj.paths.map((p) =>
+          typeof p === "string" ? normalizeFilePath(p) : p,
+        ),
+      };
+    }
+  } else if (name === "web_search") {
+    if (typeof obj.query === "string") {
+      return { ...obj, query: obj.query.trim() };
+    }
+  } else if (name === "web_extract") {
+    if (typeof obj.url === "string") {
+      return { ...obj, url: obj.url.trim().replace(/\/+$/, "") };
+    }
+  }
+  return args;
+}
+
+export function getTargetFilePath(name: string, args?: unknown): string | undefined {
+  if (!args || typeof args !== "object") return undefined;
+  const obj = args as Record<string, unknown>;
+  if (name === "edit" || name === "write" || name === "undo_last_edit") {
+    return typeof obj.path === "string" ? normalizeFilePath(obj.path) : undefined;
+  }
+  if (name === "ts_morph" && obj.operation !== "inspect") {
+    return typeof obj.filePath === "string" ? normalizeFilePath(obj.filePath) : undefined;
+  }
+  return undefined;
+}
+
+export function getReadFilePath(name: string, args?: unknown): string | undefined {
+  if (!args || typeof args !== "object") return undefined;
+  const obj = args as Record<string, unknown>;
+  if (name === "read") {
+    return typeof obj.path === "string" ? normalizeFilePath(obj.path) : undefined;
+  }
+  if (name === "ts_morph" && obj.operation === "inspect") {
+    return typeof obj.filePath === "string" ? normalizeFilePath(obj.filePath) : undefined;
+  }
+  return undefined;
+}
+
+function isReadOnlyTool(name: string, args?: unknown): boolean {
+  if (name === "ts_morph") {
+    const op = (args as Record<string, unknown> | undefined)?.operation;
+    return op === "inspect";
+  }
+  return READ_ONLY_TOOL_NAMES.has(name);
+}
+
+function isModifyingTool(name: string, args?: unknown): boolean {
+  if (name === "ts_morph") {
+    const op = (args as Record<string, unknown> | undefined)?.operation;
+    return op !== "inspect";
+  }
+  if (name === "bash" || name === "powershell") {
+    const cmd = (args as Record<string, unknown> | undefined)?.command;
+    if (typeof cmd === "string" && isReadOnlyShellCommand(cmd)) {
+      return false;
+    }
+    return true;
+  }
+  return MODIFYING_TOOL_NAMES.has(name);
+}
+function stableSerialize(value: unknown): string {
+  if (value === undefined || value === null) return "";
+  if (Array.isArray(value)) return `[${value.map(stableSerialize).join(",")}]`;
+  if (typeof value === "object") {
+    try {
+      const keys = Object.keys(value as Record<string, unknown>).sort();
+      return `{${keys
+        .map((k) => `${JSON.stringify(k)}:${stableSerialize((value as Record<string, unknown>)[k])}`)
+        .join(",")}}`;
+    } catch {
+      return String(value);
+    }
+  }
+  return JSON.stringify(value) ?? String(value);
+}
+
+function serializeArgs(args: unknown): string {
+  return stableSerialize(args);
+}
+
+function makeToolKey(name: string, args: unknown): string {
+  return `${name}:${serializeArgs(normalizeToolArgs(name, args))}`;
+}
+
+interface PendingCallInfo {
+  toolKey: string;
+  args: unknown;
+}
+
+export function getEffectiveMutationTurn(
+  toolName: string,
+  toolArgs: unknown,
+  loopState: LoopGuardState,
+): number {
+  if (
+    toolName === "read_skill" ||
+    toolName === "web_search" ||
+    toolName === "web_extract"
+  ) {
+    return -1;
+  }
+
+  const obj =
+    toolArgs && typeof toolArgs === "object"
+      ? (toolArgs as Record<string, unknown>)
+      : {};
+
+  if (toolName === "read") {
+    const rawPath =
+      typeof obj.path === "string" ? normalizeFilePath(obj.path) : undefined;
+    const fileMut =
+      rawPath !== undefined ? (loopState.fileMutations.get(rawPath) ?? -1) : -1;
+    return Math.max(loopState.lastWorkspaceMutationTurn, fileMut);
+  }
+
+  if (toolName === "ts_morph") {
+    const rawPath =
+      typeof obj.filePath === "string"
+        ? normalizeFilePath(obj.filePath)
+        : undefined;
+    const fileMut =
+      rawPath !== undefined ? (loopState.fileMutations.get(rawPath) ?? -1) : -1;
+    return Math.max(loopState.lastWorkspaceMutationTurn, fileMut);
+  }
+
+  if (toolName === "find" || toolName === "ls") {
+    const rawPath =
+      typeof obj.path === "string" ? normalizeFilePath(obj.path) : ".";
+    const dirMut = getLatestMutationInScope(
+      rawPath,
+      loopState.directoryMutations,
+    );
+    return Math.max(loopState.lastWorkspaceMutationTurn, dirMut);
+  }
+
+  if (toolName === "grep") {
+    const rawPath =
+      typeof obj.path === "string" ? normalizeFilePath(obj.path) : ".";
+    const grepMut = getLatestMutationInScope(rawPath, loopState.fileMutations);
+    return Math.max(loopState.lastWorkspaceMutationTurn, grepMut);
+  }
+
+  if (toolName === "ast_grep") {
+    if (Array.isArray(obj.paths) && obj.paths.length > 0) {
+      let maxMut = -1;
+      for (const p of obj.paths) {
+        if (typeof p === "string") {
+          maxMut = Math.max(
+            maxMut,
+            getLatestMutationInScope(normalizeFilePath(p), loopState.fileMutations),
+          );
+        }
+      }
+      return Math.max(loopState.lastWorkspaceMutationTurn, maxMut);
+    }
+    const rawPath =
+      typeof obj.path === "string" ? normalizeFilePath(obj.path) : ".";
+    const astMut = getLatestMutationInScope(rawPath, loopState.fileMutations);
+    return Math.max(loopState.lastWorkspaceMutationTurn, astMut);
+  }
+
+  return loopState.lastMutatingTurn;
+}
+
+export function isKeyInvalidatedByTarget(
+  key: string,
+  targetPath: string,
+  toolName: string,
+): boolean {
+  try {
+    const colonIdx = key.indexOf(":");
+    if (colonIdx < 0) return false;
+    const prefix = key.slice(0, colonIdx);
+    const parsed = JSON.parse(key.slice(colonIdx + 1));
+
+    if (prefix === "read") {
+      return normalizeFilePath(parsed.path) === targetPath;
+    }
+    if (prefix === "ts_morph") {
+      return normalizeFilePath(parsed.filePath) === targetPath;
+    }
+    if (prefix === "grep") {
+      const grepPath = normalizeFilePath(parsed.path ?? ".");
+      return isSubpathOrEqual(targetPath, grepPath);
+    }
+    if (prefix === "find" || prefix === "ls") {
+      if (toolName !== "write") return false;
+      const dirPath = normalizeFilePath(parsed.path ?? ".");
+      return isSubpathOrEqual(targetPath, dirPath);
+    }
+    if (prefix === "ast_grep") {
+      const paths: string[] =
+        Array.isArray(parsed.paths) && parsed.paths.length > 0
+          ? parsed.paths
+          : [parsed.path ?? "."];
+      return paths.some((p) => isSubpathOrEqual(targetPath, normalizeFilePath(p)));
+    }
+  } catch {}
+  return false;
+}
+
+interface LoopGuardState {
+  consecutiveFailures: Map<string, number>;
+  readOnlyCalls: Map<string, number>;
+  fileMutations: Map<string, number>;
+  directoryMutations: Map<string, number>;
+  lastWorkspaceMutationTurn: number;
+  lastMutatingTurn: number;
+  pendingCalls: Map<string, PendingCallInfo>;
+  blockedCalls: Set<string>;
+  blockedToolKeys: Set<string>;
+  currentTurn: number;
+}
+const sessionLoopGuardStates = new WeakMap<AgentSession, LoopGuardState>();
+const sessionControllersInstalled = new WeakSet<AgentSession>();
+
+export function installSessionToolController(
+  session: AgentSession,
+  options: {
+    inScope?: () => Set<string>;
+    isHardLimited?: () => boolean;
+    hardLimitAllowedTools?: () => string[];
+  } = {},
+): void {
+  let loopState = sessionLoopGuardStates.get(session);
+  if (!loopState) {
+    loopState = {
+      consecutiveFailures: new Map(),
+      readOnlyCalls: new Map(),
+      fileMutations: new Map(),
+      directoryMutations: new Map(),
+      lastWorkspaceMutationTurn: -1,
+      lastMutatingTurn: -1,
+      pendingCalls: new Map(),
+      blockedCalls: new Set(),
+      blockedToolKeys: new Set(),
+      currentTurn: 0,
+    };
+    sessionLoopGuardStates.set(session, loopState);
+  }
+
+  const getIsHardLimited = (): boolean => {
+    const controller = activeHardLimitControllers.get(session);
+    if (controller) {
+      return controller.isHardLimited();
+    }
+    return options.isHardLimited ? options.isHardLimited() : false;
+  };
+
+  const getHardLimitAllowedTools = (): string[] => {
+    const controller = activeHardLimitControllers.get(session);
+    if (controller) {
+      return controller.hardLimitAllowedTools();
+    }
+    return options.hardLimitAllowedTools ? options.hardLimitAllowedTools() : [];
+  };
+
+  if (!sessionControllersInstalled.has(session)) {
+    sessionControllersInstalled.add(session);
+
+    if (session.agent) {
+      const priorBeforeToolCall = session.agent.beforeToolCall;
+      session.agent.beforeToolCall = async (context: any, signal?: AbortSignal) => {
+        const toolName = context?.toolCall?.name ?? "";
+        const toolArgs = context?.args ?? context?.toolCall?.arguments;
+        const toolKey = makeToolKey(toolName, toolArgs);
+        const callId = context?.toolCall?.id;
+        if (callId) {
+          loopState.pendingCalls.set(callId, { toolKey, args: toolArgs });
+        }
+
+        if (getIsHardLimited()) {
+          const hardAllowed = getHardLimitAllowedTools();
+          if (!hardAllowed.includes(toolName)) {
+            if (callId) loopState.blockedCalls.add(callId);
+            return {
+              block: true,
+              reason: `Tool "${toolName}" is disabled by hard limit. Provide your final answer now.`,
+              ...(hardAllowed.length === 0 ? { terminate: true } : {}),
+            };
+          }
+        }
+
+        if (options.inScope && !options.inScope().has(toolName)) {
+          if (callId) loopState.blockedCalls.add(callId);
+          return {
+            block: true,
+            reason: `Tool "${toolName}" is not available to this subagent.`,
+          };
+        }
+
+        // Tool Loop Guard: consecutive identical failing tool calls
+        const failCount = loopState.consecutiveFailures.get(toolKey) ?? 0;
+        if (failCount >= 2) {
+          if (callId) {
+            loopState.blockedCalls.add(callId);
+          } else {
+            loopState.blockedToolKeys.add(toolKey);
+          }
+          return {
+            block: true,
+            reason: `Tool "${toolName}" with identical arguments has failed consecutively (${failCount} times) with no intervening modifications. Repeatedly executing the identical failing call without changing arguments or fixing preconditions is blocked to prevent an unrecoverable loop. Modify your arguments or try an alternative approach.`,
+          };
+        }
+
+        // Tool Loop Guard: redundant read-only execution
+        if (isReadOnlyTool(toolName, toolArgs)) {
+          const isPendingDuplicate = callId
+            ? Array.from(loopState.pendingCalls.entries()).some(
+                ([id, pending]) => id !== callId && pending.toolKey === toolKey && !loopState.blockedCalls.has(id),
+              )
+            : false;
+          const prevTurn = loopState.readOnlyCalls.get(toolKey);
+          const lastMut = getEffectiveMutationTurn(toolName, toolArgs, loopState);
+
+          if (
+            isPendingDuplicate ||
+            (prevTurn !== undefined && lastMut <= prevTurn)
+          ) {
+            if (callId) {
+              loopState.blockedCalls.add(callId);
+            } else {
+              loopState.blockedToolKeys.add(toolKey);
+            }
+            const isSameTurn = isPendingDuplicate || loopState.currentTurn === prevTurn;
+            const isPrecedingTurn = prevTurn !== undefined && loopState.currentTurn === prevTurn + 1;
+            const reason = isSameTurn
+              ? `Tool "${toolName}" with identical arguments was already executed in this turn. Duplicate parallel executions of identical read-only calls provide no new information. Refer to the existing tool call result.`
+              : isPrecedingTurn
+                ? `Tool "${toolName}" with identical arguments was already executed in the preceding turn with no intervening modifications. The complete result is already available in your conversation history. Refer to the existing tool result instead of re-reading.`
+                : `Tool "${toolName}" with identical arguments was already executed in turn ${(prevTurn ?? 0) + 1} with no intervening modifications. The complete result is already available in your conversation history. Refer to the existing tool result instead of re-reading.`;
+            return {
+              block: true,
+              reason,
+            };
+          }
+        }
+
+        const priorResult = await priorBeforeToolCall?.(context, signal);
+        if (priorResult?.block) {
+          if (callId) {
+            loopState.blockedCalls.add(callId);
+          } else {
+            loopState.blockedToolKeys.add(toolKey);
+          }
+        }
+        return priorResult;
+      };
+    }
+
+    session.subscribe?.((event: AgentSessionEvent) => {
+      if (event.type === "turn_end") {
+        loopState.currentTurn++;
+        loopState.pendingCalls.clear();
+        loopState.blockedCalls.clear();
+        loopState.blockedToolKeys.clear();
+      } else if (event.type === "tool_execution_start") {
+        const callId = (event as any).toolCallId;
+        if (callId && (event as any).args) {
+          const args = (event as any).args;
+          loopState.pendingCalls.set(callId, { toolKey: makeToolKey(event.toolName, args), args });
+        }
+      } else if (event.type === "tool_execution_end") {
+        const toolName = event.toolName;
+        const callId = (event as any).toolCallId;
+        const pending = callId ? loopState.pendingCalls.get(callId) : undefined;
+        const toolKey = pending?.toolKey ?? makeToolKey(toolName, (event as any).args);
+        const toolArgs = pending?.args ?? (event as any).args;
+        const wasBlocked = (callId ? loopState.blockedCalls.has(callId) : false) || loopState.blockedToolKeys.has(toolKey);
+        if (callId) {
+          loopState.pendingCalls.delete(callId);
+          loopState.blockedCalls.delete(callId);
+        }
+        loopState.blockedToolKeys.delete(toolKey);
+        if (wasBlocked) {
+          return;
+        }
+        if (event.isError) {
+          const count = loopState.consecutiveFailures.get(toolKey) ?? 0;
+          loopState.consecutiveFailures.set(toolKey, count + 1);
+        } else {
+          loopState.consecutiveFailures.delete(toolKey);
+          if (isModifyingTool(toolName, toolArgs)) {
+            loopState.lastMutatingTurn = loopState.currentTurn;
+            loopState.consecutiveFailures.clear();
+            const targetPath = getTargetFilePath(toolName, toolArgs);
+            if (targetPath !== undefined) {
+              loopState.fileMutations.set(targetPath, loopState.currentTurn);
+              if (toolName === "write") {
+                loopState.directoryMutations.set(targetPath, loopState.currentTurn);
+              }
+              for (const [key] of loopState.readOnlyCalls) {
+                if (isKeyInvalidatedByTarget(key, targetPath, toolName)) {
+                  loopState.readOnlyCalls.delete(key);
+                }
+              }
+            } else {
+              loopState.lastWorkspaceMutationTurn = loopState.currentTurn;
+              loopState.fileMutations.clear();
+              loopState.directoryMutations.clear();
+              for (const [key] of loopState.readOnlyCalls) {
+                if (
+                  !key.startsWith("read_skill:") &&
+                  !key.startsWith("web_search:") &&
+                  !key.startsWith("web_extract:")
+                ) {
+                  loopState.readOnlyCalls.delete(key);
+                }
+              }
+            }
+          } else if (isReadOnlyTool(toolName, toolArgs)) {
+            loopState.readOnlyCalls.set(toolKey, loopState.currentTurn);
+          }
+        }
+      }
+    });
+  }
+}
+
 export function installExtensionToolScope(
   session: AgentSession,
   ctx: {
@@ -253,15 +995,36 @@ export function installExtensionToolScope(
     readmitToolNames: Set<string>;
     /** Receives the scope check the child's nested-call gate extension applies. */
     nestedCallGate: NestedCallGate;
+    isHardLimited?: () => boolean;
+    hardLimitAllowedTools?: () => string[];
   },
 ): void {
   const { loader, toolNames, disallowedSet, extNames, narrowing, readmitToolNames, nestedCallGate } = ctx;
+
+  const getIsHardLimited = (): boolean => {
+    const controller = activeHardLimitControllers.get(session);
+    if (controller) {
+      return controller.isHardLimited();
+    }
+    return ctx.isHardLimited ? ctx.isHardLimited() : false;
+  };
+
+  const getHardLimitAllowedTools = (): string[] => {
+    const controller = activeHardLimitControllers.get(session);
+    if (controller) {
+      return controller.hardLimitAllowedTools();
+    }
+    return ctx.hardLimitAllowedTools ? ctx.hardLimitAllowedTools() : [];
+  };
 
   // The names allowed right now. Mirrors the `ext:` opt-in flip: when any `ext:`
   // selector is present, extension tools become an explicit allowlist — a loaded
   // extension not named by a selector contributes nothing (its handlers still ran),
   // and `ext:foo/bar` narrows `foo` to just `bar`.
   const inScope = (): Set<string> => {
+    if (getIsHardLimited()) {
+      return new Set(getHardLimitAllowedTools());
+    }
     const keep = new Set(toolNames.filter((t) => !disallowedSet?.has(t)));
     const optInActive = extNames.size > 0;
     for (const extension of loader.getExtensions().extensions) {
@@ -325,16 +1088,11 @@ export function installExtensionToolScope(
 
   nestedCallGate.allows = (name) => inScope().has(name);
 
-  const priorBeforeToolCall = session.agent.beforeToolCall;
-  session.agent.beforeToolCall = async (context, signal) => {
-    if (!inScope().has(context.toolCall.name)) {
-      return {
-        block: true,
-        reason: `Tool "${context.toolCall.name}" is not available to this subagent.`,
-      };
-    }
-    return priorBeforeToolCall?.(context, signal);
-  };
+  installSessionToolController(session, {
+    inScope,
+    isHardLimited: ctx.isHardLimited,
+    hardLimitAllowedTools: ctx.hardLimitAllowedTools,
+  });
 }
 
 /** Set once the child's tool scope is installed; until then the gate admits everything. */
@@ -409,8 +1167,8 @@ let graceTurns = 5;
 
 /** Get the grace turns value. */
 export function getGraceTurns(): number { return graceTurns; }
-/** Set the grace turns value (minimum 1). */
-export function setGraceTurns(n: number): void { graceTurns = Math.max(1, n); }
+/** Set the grace turns value (minimum 0). */
+export function setGraceTurns(n: number): void { graceTurns = Math.max(0, n); }
 
 /**
  * Try to find the right model for an agent type.
@@ -654,6 +1412,10 @@ function finalTurnError(session: AgentSession, startIndex = 0): string | undefin
 function forwardAbortSignal(session: AgentSession, signal?: AbortSignal): () => void {
   if (!signal) return () => {};
   const onAbort = () => session.abort();
+  if (signal.aborted) {
+    onAbort();
+    return () => {};
+  }
   signal.addEventListener("abort", onAbort, { once: true });
   return () => signal.removeEventListener("abort", onAbort);
 }
@@ -1125,6 +1887,24 @@ export async function runAgent(
     },
   });
 
+  // max_turns is graceful by default. hardLimit removes tools at the ceiling,
+  // leaving the model one tool-free turn to return its final answer (or only StructuredOutput if schema is set).
+  let turnCount = 0;
+  const maxTurns = resolveEffectiveMaxTurns(type, options.maxTurns);
+  const hardLimit = options.hardLimit ?? agentConfig?.hardLimit ?? false;
+  let limitReached = false;
+  let aborted = false;
+  const hardLimitAllowedTools = (): string[] =>
+    structuredTools.length > 0 ? [STRUCTURED_OUTPUT_TOOL_NAME] : [];
+  if (structuredCapture) {
+    sessionStructuredCaptures.set(session, structuredCapture);
+  }
+
+  activeHardLimitControllers.set(session, {
+    isHardLimited: () => limitReached && Boolean(hardLimit),
+    hardLimitAllowedTools,
+  });
+
   // With `allowedToolNames` unset, the registry is scoped by `excludeTools` but
   // the ACTIVE set still needs managing: pi activates only its four default
   // built-ins at turn 1, and `ext:` narrowing has no registry-level expression
@@ -1140,18 +1920,17 @@ export async function runAgent(
       narrowing,
       readmitToolNames,
       nestedCallGate,
+      isHardLimited: () => limitReached && Boolean(hardLimit),
+      hardLimitAllowedTools,
+    });
+  } else {
+    installSessionToolController(session, {
+      isHardLimited: () => limitReached && Boolean(hardLimit),
+      hardLimitAllowedTools,
     });
   }
 
   options.onSessionCreated?.(session);
-
-  // max_turns is graceful by default. hardLimit removes tools at the ceiling,
-  // leaving the model one tool-free turn to return its final answer.
-  let turnCount = 0;
-  const maxTurns = resolveEffectiveMaxTurns(type, options.maxTurns);
-  const hardLimit = options.hardLimit ?? agentConfig?.hardLimit ?? false;
-  let limitReached = false;
-  let aborted = false;
 
   let currentMessageText = "";
   const unsubTurns = session.subscribe((event: AgentSessionEvent) => {
@@ -1159,21 +1938,30 @@ export async function runAgent(
       turnCount++;
       options.onTurnEnd?.(turnCount);
       if (maxTurns != null) {
-        if (!limitReached && turnCount >= maxTurns) {
+        if (aborted) {
+          return;
+        }
+        if (turnCount >= maxTurns + graceTurns) {
+          limitReached = true;
+          aborted = true;
+          session.abort();
+        } else if (!limitReached && turnCount >= maxTurns) {
           limitReached = true;
           if (hardLimit) {
-            session.setActiveToolsByName([]);
-            session.steer("HARD LIMIT: Tools disabled. Return your final answer now without calling tools.");
+            const hardTools = hardLimitAllowedTools();
+            session.setActiveToolsByName(hardTools);
+            if (hardTools.length > 0) {
+              session.steer("HARD LIMIT: Exploration tools disabled. Return your final answer now by calling StructuredOutput.");
+            } else {
+              session.steer("HARD LIMIT: Tools disabled. Return your final answer now without calling tools.");
+            }
           } else {
             session.steer("You have reached your turn limit. Wrap up immediately — provide your final answer now.");
           }
         } else if (hardLimit && limitReached) {
           // Extension scope listeners may re-activate tools at turn_end. Keep the
-          // final-answer phase tool-free if the model emits another agentic turn.
-          session.setActiveToolsByName([]);
-        } else if (limitReached && turnCount >= maxTurns + graceTurns) {
-          aborted = true;
-          session.abort();
+          // final-answer phase tool-free (or restricted to StructuredOutput) if the model emits another agentic turn.
+          session.setActiveToolsByName(hardLimitAllowedTools());
         }
       }
     }
@@ -1235,9 +2023,13 @@ export async function runAgent(
     if (structuredCapture !== undefined && structuredCapture.json === undefined
       && !aborted && options.signal?.aborted !== true) {
       structuredRetried = true;
+      if (hardLimit) {
+        session.setActiveToolsByName([STRUCTURED_OUTPUT_TOOL_NAME]);
+      }
       await session.prompt(structuredRetryPrompt(structuredCapture));
     }
   } finally {
+    activeHardLimitControllers.delete(session);
     unsubTurns();
     collector.unsubscribe();
     cleanupAbort();
@@ -1270,12 +2062,26 @@ export async function resumeAgent(
   session: AgentSession,
   prompt: string,
   options: {
+    maxTurns?: number;
+    hardLimit?: boolean;
+    onTurnEnd?: (turnCount: number) => void;
     onToolActivity?: (activity: ToolActivity) => void;
     onAssistantUsage?: (usage: LifetimeUsage) => void;
     onCompaction?: (info: { reason: "manual" | "threshold" | "overflow"; tokensBefore: number }) => void;
     signal?: AbortSignal;
   } = {},
-): Promise<{ text: string; failure?: string }> {
+): Promise<{ text: string; aborted?: boolean; steered?: boolean; failure?: string; structuredJson?: string }> {
+  // If active tools were emptied (e.g. by hardLimit in a previous run), restore all
+  // tools configured for this session so the resumed agent has tools available.
+  if (session.getActiveToolNames && session.getAllTools) {
+    const active = session.getActiveToolNames();
+    const all = session.getAllTools();
+    const isHardLimitedState = (active.length === 0 && all.length > 0) || (active.length === 1 && active[0] === STRUCTURED_OUTPUT_TOOL_NAME && all.length > 1);
+    if (isHardLimitedState) {
+      session.setActiveToolsByName(all.map((t) => t.name));
+    }
+  }
+
   // Boundary for the history fallback: the session already holds prior turns,
   // so only assistant text produced by THIS resume prompt counts as its output
   // — a failed resume must not surface the previous turn's answer (#144).
@@ -1283,30 +2089,89 @@ export async function resumeAgent(
   const collector = collectResponseText(session);
   const cleanupAbort = forwardAbortSignal(session, options.signal);
 
-  const unsubEvents = (options.onToolActivity || options.onAssistantUsage || options.onCompaction)
-    ? session.subscribe((event: AgentSessionEvent) => {
-        if (event.type === "tool_execution_start") options.onToolActivity?.({ type: "start", toolName: event.toolName });
-        if (event.type === "tool_execution_end") options.onToolActivity?.({ type: "end", toolName: event.toolName });
-        if (event.type === "message_end" && event.message.role === "assistant") {
-          const u = (event.message as any).usage;
-          if (u) options.onAssistantUsage?.({
-            input: u.input ?? 0,
-            output: u.output ?? 0,
-            cacheWrite: u.cacheWrite ?? 0,
-            cacheRead: u.cacheRead ?? 0,
-            cost: u.cost?.total ?? 0,
-          });
+  let turnCount = 0;
+  const maxTurns = normalizeMaxTurns(options.maxTurns);
+  const hardLimit = options.hardLimit ?? false;
+  let limitReached = false;
+  let aborted = false;
+  const structuredCapture = sessionStructuredCaptures.get(session);
+  if (structuredCapture) {
+    structuredCapture.called = false;
+    structuredCapture.json = undefined;
+    structuredCapture.lastError = undefined;
+  }
+  const hasStructuredTool = Boolean(
+    structuredCapture ||
+    session.getAllTools?.().some((t) => t.name === STRUCTURED_OUTPUT_TOOL_NAME),
+  );
+  const hardLimitAllowedTools = (): string[] =>
+    hasStructuredTool ? [STRUCTURED_OUTPUT_TOOL_NAME] : [];
+
+  activeHardLimitControllers.set(session, {
+    isHardLimited: () => limitReached && Boolean(hardLimit),
+    hardLimitAllowedTools,
+  });
+
+  installSessionToolController(session);
+  const loopState = sessionLoopGuardStates.get(session);
+  if (loopState) {
+    loopState.consecutiveFailures.clear();
+    loopState.pendingCalls.clear();
+    loopState.blockedCalls.clear();
+    loopState.blockedToolKeys.clear();
+  }
+  const unsubEvents = session.subscribe((event: AgentSessionEvent) => {
+    if (event.type === "turn_end") {
+      turnCount++;
+      options.onTurnEnd?.(turnCount);
+      if (maxTurns != null) {
+        if (aborted) {
+          return;
         }
-        if (event.type === "compaction_end" && !event.aborted && event.result) {
-          options.onCompaction?.({ reason: event.reason, tokensBefore: event.result.tokensBefore });
+        if (turnCount >= maxTurns + graceTurns) {
+          limitReached = true;
+          aborted = true;
+          session.abort();
+        } else if (!limitReached && turnCount >= maxTurns) {
+          limitReached = true;
+          if (hardLimit) {
+            const hardTools = hardLimitAllowedTools();
+            session.setActiveToolsByName(hardTools);
+            if (hardTools.length > 0) {
+              session.steer("HARD LIMIT: Exploration tools disabled. Return your final answer now by calling StructuredOutput.");
+            } else {
+              session.steer("HARD LIMIT: Tools disabled. Return your final answer now without calling tools.");
+            }
+          } else {
+            session.steer("You have reached your turn limit. Wrap up immediately — provide your final answer now.");
+          }
+        } else if (hardLimit && limitReached) {
+          session.setActiveToolsByName(hardLimitAllowedTools());
         }
-      })
-    : () => {};
+      }
+    }
+    if (event.type === "tool_execution_start") options.onToolActivity?.({ type: "start", toolName: event.toolName });
+    if (event.type === "tool_execution_end") options.onToolActivity?.({ type: "end", toolName: event.toolName });
+    if (event.type === "message_end" && event.message.role === "assistant") {
+      const u = (event.message as any).usage;
+      if (u) options.onAssistantUsage?.({
+        input: u.input ?? 0,
+        output: u.output ?? 0,
+        cacheWrite: u.cacheWrite ?? 0,
+        cacheRead: u.cacheRead ?? 0,
+        cost: u.cost?.total ?? 0,
+      });
+    }
+    if (event.type === "compaction_end" && !event.aborted && event.result) {
+      options.onCompaction?.({ reason: event.reason, tokensBefore: event.result.tokensBefore });
+    }
+  });
 
   try {
     // Already aborted: not prompted, as in `runAgent`.
     if (options.signal?.aborted !== true) await session.prompt(prompt);
   } finally {
+    activeHardLimitControllers.delete(session);
     collector.unsubscribe();
     unsubEvents();
     cleanupAbort();
@@ -1314,7 +2179,10 @@ export async function resumeAgent(
 
   return {
     text: collector.getText().trim() || getLastAssistantText(session, startLen),
+    aborted,
+    steered: limitReached,
     failure: finalTurnError(session, startLen),
+    ...(structuredCapture?.json !== undefined ? { structuredJson: structuredCapture.json } : {}),
   };
 }
 

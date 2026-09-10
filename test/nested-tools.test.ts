@@ -286,6 +286,50 @@ describe("child-safe nested Agent tools", () => {
     expect(manager.resume).not.toHaveBeenCalled();
   });
 
+  it("supports nested resume with background execution, turn limits, and re-entrancy guard", async () => {
+    const [agent] = tools(["scout"]);
+    records.set("child-own", {
+      id: "child-own",
+      status: "completed",
+      result: "initial done",
+      parentAgentId: "parent-1",
+      session: { steer: vi.fn() },
+    });
+
+    // 1. In-flight guard: when running, blocks resume with actionable message
+    records.get("child-own")!.status = "running";
+    const inFlightResult = await execute(agent, {
+      resume: "child-own",
+      subagent_type: "scout",
+      description: "resume running",
+      prompt: "Continue",
+    });
+    expect(inFlightResult.isError).toBe(true);
+    expect(inFlightResult.content[0].text).toContain("is still running");
+    expect(manager.resume).not.toHaveBeenCalled();
+
+    // 2. Background resume
+    records.get("child-own")!.status = "completed";
+    vi.mocked(manager.resume).mockResolvedValueOnce(records.get("child-own")!);
+
+    const bgResult = await execute(agent, {
+      resume: "child-own",
+      subagent_type: "scout",
+      description: "resume bg",
+      prompt: "Continue in bg",
+      run_in_background: true,
+      max_turns: 3,
+      hard_limit: true,
+    });
+    expect(bgResult.isError).toBe(false);
+    expect(bgResult.content[0].text).toContain("Nested agent resumed in background");
+    expect(manager.resume).toHaveBeenCalledWith("child-own", "Continue in bg", undefined, {
+      isBackground: true,
+      maxTurns: 3,
+      hardLimit: true,
+    });
+  });
+
   it("reports a background child that fails to start as a tool error", async () => {
     // Under isolation: "worktree" the child is not running when spawn() returns
     // — the repo copy is awaited. The failure must reach the parent as an error

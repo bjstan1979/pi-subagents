@@ -948,6 +948,26 @@ describe("Claude Code option compatibility", () => {
     expect(stub.calls[0]).toMatchObject({ label: "L", agentType: "general-purpose", effort: "high" });
   });
 
+  it("accepts maxTurns and hardLimit options on agent() and plumbs them to the host", async () => {
+    const stub = stubHost();
+    const result = await run(
+      "return await agent('go', { maxTurns: 10, hardLimit: true });",
+      { host: stub.host },
+    );
+
+    expect(result.status).toBe("completed");
+    expect(stub.calls[0]).toMatchObject({ maxTurns: 10, hardLimit: true });
+  });
+
+  it("rejects non-integer or non-positive maxTurns and non-boolean hardLimit", async () => {
+    const r1 = await run("return await agent('go', { maxTurns: -1 });", { host: stubHost().host });
+    expect(r1.status).toBe("failed");
+    expect(r1.error).toMatch(/maxTurns must be a positive integer/);
+
+    const r2 = await run("return await agent('go', { hardLimit: 'yes' });", { host: stubHost().host });
+    expect(r2.status).toBe("failed");
+    expect(r2.error).toMatch(/hardLimit must be a boolean/);
+  });
   it("passes each pipeline stage (previous, item, index), as Claude Code does", async () => {
     const result = await run(
       "return JSON.stringify(await pipeline(['a','b'], (p, item, i) => item + i, (p, item, i) => p + '/' + item + i));",

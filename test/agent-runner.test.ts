@@ -206,7 +206,11 @@ const ctx = {
 
 const pi = {} as any;
 
+let savedSessionDir: string | undefined;
+
 beforeEach(() => {
+  savedSessionDir = process.env.PI_CODING_AGENT_SESSION_DIR;
+  delete process.env.PI_CODING_AGENT_SESSION_DIR;
   createAgentSession.mockReset();
   defaultResourceLoaderCtor.mockClear();
   getAgentDir.mockClear();
@@ -222,6 +226,14 @@ beforeEach(() => {
   vi.mocked(createNestedSubagentTools).mockClear();
   loaderExtensionsRef.current = { extensions: [], errors: [], runtime: {} };
   lastSession = undefined;
+});
+
+afterEach(() => {
+  if (savedSessionDir !== undefined) {
+    process.env.PI_CODING_AGENT_SESSION_DIR = savedSessionDir;
+  } else {
+    delete process.env.PI_CODING_AGENT_SESSION_DIR;
+  }
 });
 
 describe("agent-runner final output capture", () => {
@@ -1780,7 +1792,32 @@ describe("agent-runner async extension tool registration", () => {
     // asynchronously, so there is no active-set narrowing to maintain.
     expect(createAgentSession.mock.calls[0][0].tools).toEqual(["read"]);
     expect(session.setActiveToolsByName).not.toHaveBeenCalled();
-    expect(session.agent.beforeToolCall).toBeUndefined();
+    // Universal session tool controller installs ToolLoopGuard even in isolated mode
+    expect(session.agent.beforeToolCall).toBeDefined();
+  });
+
+  it("isolated subagent has active ToolLoopGuard that blocks redundant reads", async () => {
+    vi.mocked(getConfig).mockReturnValueOnce(makeConfig({ extensions: false }));
+    vi.mocked(getAgentConfig).mockReturnValueOnce(makeAgentConfig({ extensions: false }));
+    vi.mocked(getToolNamesForType).mockReturnValueOnce(["read"]);
+    const { session, listeners } = createSession("OK");
+    createAgentSession.mockResolvedValue({ session });
+
+    await runAgent(ctx, "Explore", "go", { pi, isolated: true });
+    expect(session.agent.beforeToolCall).toBeDefined();
+
+    // Simulate read completion in turn 1
+    for (const l of [...listeners]) {
+      l({ type: "tool_execution_end", toolCallId: "r1", toolName: "read", args: { path: "isolated.ts" }, isError: false });
+      l({ type: "turn_end" });
+    }
+
+    // Turn 2: re-reading identical file must be blocked by ToolLoopGuard
+    const res = await session.agent.beforeToolCall?.({
+      toolCall: { id: "r2", name: "read", arguments: { path: "isolated.ts" } },
+    });
+    expect(res?.block).toBe(true);
+    expect(res?.reason).toMatch(/already executed in the preceding turn/);
   });
 });
 
@@ -2754,6 +2791,47 @@ describe("agent-runner turn limits", () => {
     expect(session.abort).not.toHaveBeenCalled();
   });
 
+  it("preserves StructuredOutput tool when hardLimit is reached with structured output schema", async () => {
+    let calls = 0;
+    const { session, listeners } = createSession("OK");
+    session.prompt.mockImplementation(async () => {
+      calls++;
+      if (calls === 1) {
+        for (let i = 0; i < 5; i++) {
+          for (const l of [...listeners]) l({ type: "turn_end" });
+        }
+      } else if (calls === 2) {
+        const tool = customTool("StructuredOutput");
+        await tool.execute("tc-retry", { answer: "recovered" });
+      }
+    });
+    createAgentSession.mockResolvedValue({ session });
+    const result = await runAgent(ctx, "Explore", "go", {
+      pi,
+      maxTurns: 5,
+      hardLimit: true,
+      structuredOutput: STRUCTURED,
+    });
+    expect(session.setActiveToolsByName).toHaveBeenCalledWith(["StructuredOutput"]);
+    expect(session.getActiveToolNames()).toEqual(["StructuredOutput"]);
+    expect(session.steer).toHaveBeenCalledTimes(1);
+    expect(session.steer.mock.calls[0][0]).toContain("StructuredOutput");
+    expect(session.abort).not.toHaveBeenCalled();
+    expect(result.steered).toBe(true);
+    expect(result.structuredJson).toBe(JSON.stringify({ answer: "recovered" }));
+  });
+
+  it("does not allow extension scoping to re-enable extension tools once hardLimit is active", async () => {
+    vi.mocked(getConfig).mockReturnValue(makeConfig({ extensions: true }));
+    withExtensions({ "/ext/ok.ts": ["ok_ext"] });
+    const { session } = await runWithTurns(
+      6,
+      { maxTurns: 5, hardLimit: true },
+      makeAgentConfig({ extensions: true }),
+    );
+    // At turn 5 hard limit trips -> tools empty. At turn 6 turn_end, extension tool scoping shouldn't re-add ok_ext
+    expect(session.getActiveToolNames()).toEqual([]);
+  });
   it.each([false, true])("preserves a tools:none agent in hardLimit=%s mode", async (hardLimit) => {
     vi.mocked(getToolNamesForType).mockReturnValueOnce([]);
     await runWithTurns(
@@ -2777,7 +2855,36 @@ describe("agent-runner turn limits", () => {
     setGraceTurns(2);
     const { session, result } = await runWithTurns(7, { maxTurns: 5 });
     expect(session.steer).toHaveBeenCalledTimes(1);
-    expect(session.abort).toHaveBeenCalled();
+    expect(session.abort).toHaveBeenCalledTimes(1);
+    expect(result.aborted).toBe(true);
+  });
+
+  it("hard-aborts once the grace turns are used up in hardLimit mode", async () => {
+    setGraceTurns(2);
+    const { session, result } = await runWithTurns(7, { maxTurns: 5, hardLimit: true });
+    expect(session.steer).toHaveBeenCalledTimes(1);
+    expect(session.abort).toHaveBeenCalledTimes(1);
+    expect(result.aborted).toBe(true);
+  });
+
+  it("aborts immediately when graceTurns is 0", async () => {
+    setGraceTurns(0);
+    const { session, result } = await runWithTurns(5, { maxTurns: 5, hardLimit: true });
+    expect(session.abort).toHaveBeenCalledTimes(1);
+    expect(result.aborted).toBe(true);
+  });
+
+  it("does not call abort repeatedly on subsequent turns after aborting (hardLimit mode)", async () => {
+    setGraceTurns(2);
+    const { session, result } = await runWithTurns(10, { maxTurns: 5, hardLimit: true });
+    expect(session.abort).toHaveBeenCalledTimes(1);
+    expect(result.aborted).toBe(true);
+  });
+
+  it("does not call abort repeatedly on subsequent turns after aborting (soft limit mode)", async () => {
+    setGraceTurns(2);
+    const { session, result } = await runWithTurns(10, { maxTurns: 5 });
+    expect(session.abort).toHaveBeenCalledTimes(1);
     expect(result.aborted).toBe(true);
   });
 
@@ -2893,6 +3000,28 @@ describe("agent-runner abort signal forwarding", () => {
     await runAgent(ctx, "Explore", "go", { pi });
 
     expect(session.abort).not.toHaveBeenCalled();
+  });
+
+  it("aborts the session immediately when the parent signal is already aborted", async () => {
+    vi.mocked(getAgentConfig).mockReturnValueOnce(makeAgentConfig());
+    const controller = new AbortController();
+    controller.abort();
+    const { session } = createSession("OK");
+    createAgentSession.mockResolvedValue({ session });
+
+    await runAgent(ctx, "Explore", "go", { pi, signal: controller.signal });
+
+    expect(session.abort).toHaveBeenCalled();
+  });
+
+  it("resumeAgent aborts the session immediately when the signal is already aborted", async () => {
+    const controller = new AbortController();
+    controller.abort();
+    const { session } = createSession("OK");
+
+    await resumeAgent(session as any, "continue", { signal: controller.signal });
+
+    expect(session.abort).toHaveBeenCalled();
   });
 });
 

@@ -2198,6 +2198,160 @@ describe("AgentManager — background resume", () => {
     expect(onComplete).not.toHaveBeenCalled();
   });
 
+  it("refuses to foreground-resume an agent whose run is still in flight", async () => {
+    manager = new AgentManager();
+    const id = await spawnSettled(manager);
+
+    vi.mocked(resumeAgent).mockClear();
+    vi.mocked(resumeAgent).mockImplementation(() => new Promise(() => {}));
+
+    const first = await manager.resume(id, "go", undefined, { isBackground: true });
+    expect(first?.status).toBe("running");
+
+    const second = await manager.resume(id, "go foreground");
+    expect(second).toBeUndefined();
+    expect(resumeAgent).toHaveBeenCalledTimes(1);
+    expect(manager.getRecord(id)!.status).toBe("running");
+  });
+
+  it("refuses to foreground-resume an agent that is still queued", async () => {
+    manager = new AgentManager(undefined, 1); // maxConcurrent = 1
+    const id = await spawnSettled(manager);
+
+    vi.mocked(runAgent).mockImplementation(() => new Promise(() => {}));
+    manager.spawn(mockPi, mockCtx, "general-purpose", "blocker", {
+      description: "blocker",
+      isBackground: true,
+    });
+
+    vi.mocked(resumeAgent).mockClear();
+    vi.mocked(resumeAgent).mockImplementation(() => new Promise(() => {}));
+    expect((await manager.resume(id, "later", undefined, { isBackground: true }))?.status).toBe("queued");
+
+    expect(await manager.resume(id, "later foreground")).toBeUndefined();
+    expect(resumeAgent).not.toHaveBeenCalled();
+  });
+
+  it("manager.abort(id) during foreground resume aborts the in-flight run and preserves 'stopped' status", async () => {
+    manager = new AgentManager();
+    const id = await spawnSettled(manager);
+
+    let resolveResume!: (v: { text: string }) => void;
+    let receivedSignal: AbortSignal | undefined;
+    vi.mocked(resumeAgent).mockClear();
+    vi.mocked(resumeAgent).mockImplementation((_session, _prompt, opts: any) => {
+      receivedSignal = opts?.signal;
+      return new Promise((resolve) => { resolveResume = resolve; });
+    });
+
+    const resumePromise = manager.resume(id, "long task");
+    const record = manager.getRecord(id)!;
+    expect(record.status).toBe("running");
+    expect(receivedSignal?.aborted).toBe(false);
+
+    expect(manager.abort(id)).toBe(true);
+    expect(record.status).toBe("stopped");
+    expect(receivedSignal?.aborted).toBe(true);
+
+    resolveResume({ text: "partial output before stop" });
+    const settled = await resumePromise;
+
+    expect(settled?.status).toBe("stopped");
+    expect(settled?.result).toBe("partial output before stop");
+  });
+
+  it("parent signal abort during foreground resume aborts the child and preserves 'stopped' status", async () => {
+    manager = new AgentManager();
+    const id = await spawnSettled(manager);
+    const parent = new AbortController();
+
+    let resolveResume!: (v: { text: string }) => void;
+    let receivedSignal: AbortSignal | undefined;
+    vi.mocked(resumeAgent).mockClear();
+    vi.mocked(resumeAgent).mockImplementation((_session, _prompt, opts: any) => {
+      receivedSignal = opts?.signal;
+      return new Promise((resolve) => { resolveResume = resolve; });
+    });
+
+    const resumePromise = manager.resume(id, "interruptible", parent.signal);
+    const record = manager.getRecord(id)!;
+    expect(record.status).toBe("running");
+
+    parent.abort();
+    expect(record.status).toBe("stopped");
+    expect(receivedSignal?.aborted).toBe(true);
+
+    resolveResume({ text: "interrupted text" });
+    const settled = await resumePromise;
+
+    expect(settled?.status).toBe("stopped");
+    expect(settled?.result).toBe("interrupted text");
+  });
+
+  it("already-aborted parent signal immediately aborts foreground resume as 'stopped'", async () => {
+    manager = new AgentManager();
+    const id = await spawnSettled(manager);
+    const parent = new AbortController();
+    parent.abort();
+
+    let receivedSignal: AbortSignal | undefined;
+    vi.mocked(resumeAgent).mockClear();
+    vi.mocked(resumeAgent).mockImplementation((_session, _prompt, opts: any) => {
+      receivedSignal = opts?.signal;
+      return Promise.resolve({ text: "" });
+    });
+
+    const record = await manager.resume(id, "pre-aborted", parent.signal);
+
+    expect(record?.status).toBe("stopped");
+    expect(receivedSignal?.aborted).toBe(true);
+  });
+
+  it("tracks record.promise during in-flight foreground resume so waitForAll() awaits it", async () => {
+    manager = new AgentManager();
+    const id = await spawnSettled(manager);
+
+    let finish!: (v: { text: string }) => void;
+    vi.mocked(resumeAgent).mockClear();
+    vi.mocked(resumeAgent).mockImplementation(
+      () => new Promise((resolve) => { finish = resolve; }),
+    );
+
+    const resumePromise = manager.resume(id, "async foreground");
+    const record = manager.getRecord(id)!;
+    expect(record.status).toBe("running");
+    expect(record.promise).toBeDefined();
+
+    let waited = false;
+    const waitPromise = manager.waitForAll().then(() => { waited = true; });
+
+    await Promise.resolve();
+    expect(waited).toBe(false);
+
+    finish({ text: "finished" });
+    await resumePromise;
+    await waitPromise;
+
+    expect(waited).toBe(true);
+    expect(record.status).toBe("completed");
+  });
+
+  it("failed final turn on foreground resume maps to error (#144) and retains partial output", async () => {
+    manager = new AgentManager();
+    const id = await spawnSettled(manager);
+
+    vi.mocked(resumeAgent).mockResolvedValue({
+      text: "partial progress",
+      failure: "upstream provider error",
+    } as any);
+
+    const record = await manager.resume(id, "fail");
+
+    expect(record?.status).toBe("error");
+    expect(record?.error).toBe("upstream provider error");
+    expect(record?.result).toBe("partial progress");
+  });
+
   // A detached resume returns while the record is still "running", so nothing
   // stops a second resume of the same agent. Starting one would replace
   // record.abortController — leaving the live run unreachable from /agents stop

@@ -331,6 +331,10 @@ const AGENT_OPTIONS = [
   "resume",
   "effort",
   "schema",
+  "maxTurns",
+  "max_turns",
+  "hardLimit",
+  "hard_limit",
 ];
 
 /** Claude Code options this runtime does not have, and why. */
@@ -516,13 +520,28 @@ async function agentIn(scope, prompt, opts) {
       throw new Error("agent() opts.gate cannot be combined with opts.resume.");
     }
   }
+  const rawMaxTurns = options.maxTurns !== undefined ? options.maxTurns : options.max_turns;
+  let maxTurns;
+  if (rawMaxTurns !== undefined && rawMaxTurns !== null) {
+    if (typeof rawMaxTurns !== "number" || !Number.isInteger(rawMaxTurns) || rawMaxTurns < 1) {
+      throw new Error("agent() opts.maxTurns must be a positive integer.");
+    }
+    maxTurns = rawMaxTurns;
+  }
+  const rawHardLimit = options.hardLimit !== undefined ? options.hardLimit : options.hard_limit;
+  let hardLimit;
+  if (rawHardLimit !== undefined && rawHardLimit !== null) {
+    if (typeof rawHardLimit !== "boolean") {
+      throw new Error("agent() opts.hardLimit must be a boolean.");
+    }
+    hardLimit = rawHardLimit;
+  }
 
   // An explicit opts.phase files this agent under that phase without moving
   // the ambient one, so a stray verify step does not re-point the phases that
   // follow it.
   const phaseIndex = phaseName !== undefined ? definePhaseIn(scope, phaseName) : scope.ambientPhaseIndex;
   const phaseTitle = phaseName !== undefined ? scopedTitle(scope, phaseName) : scope.ambientPhaseTitle;
-
   const result = await callHost("agent", {
     prompt: text,
     label: label,
@@ -535,6 +554,8 @@ async function agentIn(scope, prompt, opts) {
     resume: resume,
     effort: effort,
     schema: schema,
+    maxTurns: maxTurns,
+    hardLimit: hardLimit,
   });
   if (result === undefined || result === null) return null;
   if (schema === undefined) return result;

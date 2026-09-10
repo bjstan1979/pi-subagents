@@ -311,6 +311,12 @@ interface ResumeOptions {
    * record — the historical behavior.
    */
   isBackground?: boolean;
+  /** Turn ceiling for this resumed run. */
+  maxTurns?: number;
+  /** Disable tools at maxTurns and require final answer. */
+  hardLimit?: boolean;
+  /** Turn progress callback. */
+  onTurnEnd?: (turnCount: number) => void;
   /** Called on tool start/end with activity info (for streaming progress to UI). */
   onToolActivity?: (activity: ToolActivity) => void;
   /** Called once per assistant message_end with that message's usage delta. */
@@ -932,11 +938,11 @@ export class AgentManager {
         return responseText;
       })
       .catch(async (err) => {
-        // Don't overwrite status if externally stopped via abort()
+        // Don't overwrite status or error if externally stopped via abort()
         if (record.status !== "stopped") {
           record.status = "error";
+          record.error = err instanceof Error ? err.message : String(err);
         }
-        record.error = err instanceof Error ? err.message : String(err);
         record.completedAt ??= Date.now();
 
         detach();
@@ -1178,6 +1184,10 @@ export class AgentManager {
   ): Promise<AgentRecord | undefined> {
     const record = this.agents.get(id);
     if (!record?.session) return undefined;
+    // Never re-enter a run that is still in flight (foreground or background).
+    // Starting a second run would trample record.abortController, desync the state
+    // machine, and reject from session.prompt() with "Agent is already processing".
+    if (record.status === "running" || record.status === "queued") return undefined;
 
     // Background resume: settle asynchronously and notify on completion exactly
     // like a background spawn, returning immediately with the record still
@@ -1186,17 +1196,6 @@ export class AgentManager {
     // returned before its background branch, and resume() only ever awaited
     // inline), so a resumed agent always blocked the caller until it finished.
     if (options?.isBackground) {
-      // Never re-enter a run that is still in flight. Detaching means the caller
-      // gets control back while the record stays "running", so nothing stops the
-      // model from resuming the same agent again. Starting a second run would
-      // overwrite record.abortController — orphaning the live run beyond the
-      // reach of `/agents` stop and abortAll() — double-count the pool slot, and
-      // then reject from session.prompt() with "Agent is already processing",
-      // whose settle path would abort the LIVE run's children and report a
-      // failure for a run that is still going. Refuse instead, leaving the
-      // record untouched; the caller decides whether to wait or steer.
-      if (record.status === "running" || record.status === "queued") return undefined;
-
       record.isBackground = true;
       record.resultConsumed = false;
       record.result = undefined;
@@ -1238,9 +1237,32 @@ export class AgentManager {
     record.completedAt = undefined;
     record.result = undefined;
     record.error = undefined;
+    record.structuredJson = undefined;
+    record.structuredRetried = undefined;
+
+    // Fresh abort controller so UI stop, /agents, and workflow abort reach THIS run.
+    const abortController = new AbortController();
+    record.abortController = abortController;
+
+    let detachParentSignal: (() => void) | undefined;
+    if (signal) {
+      if (signal.aborted) {
+        this.abort(id);
+      } else {
+        const onParentAbort = () => this.abort(id);
+        signal.addEventListener("abort", onParentAbort, { once: true });
+        detachParentSignal = () => signal.removeEventListener("abort", onParentAbort);
+      }
+    }
 
     try {
-      const { text, failure } = await resumeAgent(record.session, prompt, {
+      const promise = resumeAgent(record.session, prompt, {
+        maxTurns: options?.maxTurns,
+        hardLimit: options?.hardLimit,
+        onTurnEnd: (turn) => {
+          record.toolUses = Math.max(record.toolUses, turn);
+          options?.onTurnEnd?.(turn);
+        },
         onToolActivity: (activity) => {
           if (activity.type === "end") record.toolUses++;
           options?.onToolActivity?.(activity);
@@ -1255,24 +1277,37 @@ export class AgentManager {
           this.onCompact?.(record, info);
           options?.onCompaction?.(info);
         },
-        signal,
+        signal: abortController.signal,
       });
-      // Same contract as the spawn path (#144): a failed final turn is an
-      // error, not a completion — but the resumed text stays available.
-      record.status = failure ? "error" : "completed";
-      if (failure) record.error = failure;
+      record.promise = promise.then(({ text }) => text).catch(() => "");
+      const { text, aborted, steered, failure, structuredJson } = await promise;
+      // Don't overwrite status if externally stopped via abort().
+      if ((record.status as AgentRecord["status"]) !== "stopped") {
+        if (aborted) {
+          record.status = "aborted";
+        } else if (failure) {
+          record.status = "error";
+          record.error = failure;
+        } else {
+          record.status = steered ? "steered" : "completed";
+        }
+      }
       record.result = text;
-      record.completedAt = Date.now();
+      record.structuredJson = structuredJson;
+      record.completedAt ??= Date.now();
     } catch (err) {
-      record.status = "error";
-      record.error = err instanceof Error ? err.message : String(err);
-      record.completedAt = Date.now();
+      if ((record.status as AgentRecord["status"]) !== "stopped") {
+        record.status = "error";
+        record.error = err instanceof Error ? err.message : String(err);
+      }
+      record.completedAt ??= Date.now();
+    } finally {
+      detachParentSignal?.();
+      record.resultConsumed = true;
+      // Same contract as the spawn settle paths: children spawned during the
+      // resumed turn must not outlive it — nothing else can see or reach them.
+      this.abortOwnedChildren(id);
     }
-
-    // Same contract as the spawn settle paths: children spawned during the
-    // resumed turn must not outlive it — nothing else can see or reach them.
-    this.abortOwnedChildren(id);
-
     return record;
   }
 
@@ -1294,6 +1329,11 @@ export class AgentManager {
 
     record.status = "running";
     record.startedAt = Date.now();
+    record.completedAt = undefined;
+    record.result = undefined;
+    record.error = undefined;
+    record.structuredJson = undefined;
+    record.structuredRetried = undefined;
     if (occupiesPoolSlot(record)) this.runningBackground++;
     this.onStart?.(record);
 
@@ -1307,9 +1347,12 @@ export class AgentManager {
     // for a detached one — background spawns omit it for exactly this reason.
     let detachParentSignal: (() => void) | undefined;
     if (parentSignal) {
-      const onParentAbort = () => this.abort(id);
-      parentSignal.addEventListener("abort", onParentAbort, { once: true });
-      detachParentSignal = () => parentSignal.removeEventListener("abort", onParentAbort);
+      if (parentSignal.aborted) this.abort(id);
+      else {
+        const onParentAbort = () => this.abort(id);
+        parentSignal.addEventListener("abort", onParentAbort, { once: true });
+        detachParentSignal = () => parentSignal.removeEventListener("abort", onParentAbort);
+      }
     }
 
     // Per-run side effects (output streaming) — see ResumeOptions.onStarted.
@@ -1332,6 +1375,12 @@ export class AgentManager {
     };
 
     const promise = resumeAgent(record.session, prompt, {
+      maxTurns: options?.maxTurns,
+      hardLimit: options?.hardLimit,
+      onTurnEnd: (turn) => {
+        record.toolUses = Math.max(record.toolUses, turn);
+        options?.onTurnEnd?.(turn);
+      },
       onToolActivity: (activity) => {
         if (activity.type === "end") record.toolUses++;
         options.onToolActivity?.(activity);
@@ -1348,15 +1397,20 @@ export class AgentManager {
       },
       signal: abortController.signal,
     })
-      .then(({ text, failure }) => {
+      .then(({ text, aborted, steered, failure, structuredJson }) => {
         // Don't overwrite status if externally stopped via abort().
         if (record.status !== "stopped") {
-          // Same contract as the spawn path (#144): a failed final turn is an
-          // error, not a completion — but the resumed text stays available.
-          record.status = failure ? "error" : "completed";
-          if (failure) record.error = failure;
+          if (aborted) {
+            record.status = "aborted";
+          } else if (failure) {
+            record.status = "error";
+            record.error = failure;
+          } else {
+            record.status = steered ? "steered" : "completed";
+          }
         }
         record.result = text;
+        record.structuredJson = structuredJson;
         record.completedAt ??= Date.now();
         settle();
         return text;

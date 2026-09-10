@@ -327,10 +327,14 @@ export function createWorkflowHost(deps: WorkflowHostOptions): WorkflowHost {
             // would describe a precedence this path does not have.
             invocation: {
               ...(request.effort !== undefined ? { thinking: request.effort as ThinkingLevel } : {}),
+              ...(request.maxTurns !== undefined ? { maxTurns: request.maxTurns } : {}),
+              ...(request.hardLimit !== undefined ? { hardLimit: request.hardLimit } : {}),
             },
             // Fires once the child's session exists, which is where the model
             // and the clamped thinking level first become knowable.
             onSessionCreated: () => { sessionReady = true; reportResolved(); },
+            ...(request.maxTurns !== undefined ? { maxTurns: request.maxTurns } : {}),
+            ...(request.hardLimit !== undefined ? { hardLimit: request.hardLimit } : {}),
             ...(request.schema !== undefined ? { structuredOutput: request.schema } : {}),
             ...(request.isolation !== undefined ? { isolation: request.isolation } : {}),
             ...(deps.signal !== undefined ? { signal: deps.signal } : {}),
@@ -365,13 +369,22 @@ export function createWorkflowHost(deps: WorkflowHostOptions): WorkflowHost {
       if (id !== undefined) manager.abort(id);
     },
 
-    async resumeAgent(agentId, prompt, onResolved) {
+    async resumeAgent(agentId, prompt, onResolved, options) {
       const id = records.get(agentId);
       if (id === undefined) {
         return { ok: false, error: `Cannot resume "${agentId}" — it never started.` };
       }
-      const record = await manager.resume(id, prompt, deps.signal);
+      const record = options !== undefined
+        ? await manager.resume(id, prompt, deps.signal, options)
+        : await manager.resume(id, prompt, deps.signal);
       if (record === undefined) {
+        const inFlight = manager.getRecord?.(id);
+        if (inFlight?.status === "running" || inFlight?.status === "queued") {
+          return {
+            ok: false,
+            error: `Cannot resume "${agentId}" — agent is already ${inFlight.status}.`,
+          };
+        }
         return {
           ok: false,
           error: `Agent ${id} has no session left to resume — records are dropped ten minutes after they finish.`,

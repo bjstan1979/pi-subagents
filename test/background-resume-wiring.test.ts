@@ -287,4 +287,55 @@ describe("Agent tool — background resume wiring", () => {
 
     await lifecycle.get("session_shutdown")?.({}, ctx);
   });
+
+  it("refuses a foreground resume while the agent is in flight and suggests steer_subagent", async () => {
+    const { pi, tools, lifecycle } = makePi();
+    subagentsExtension(pi);
+    const ctx = makeCtx(cwd);
+    const id = await spawnSettled(tools, ctx);
+
+    vi.mocked(resumeAgent).mockImplementation(() => new Promise(() => {}));
+    vi.mocked(resumeAgent).mockClear();
+
+    const bgParams = { prompt: "keep going", description: "Keep going", subagent_type: "general-purpose", resume: id, run_in_background: true };
+    await tools.get("Agent").execute("resume-1", bgParams, undefined, undefined, ctx);
+
+    const fgParams = { prompt: "keep going", description: "Keep going", subagent_type: "general-purpose", resume: id, run_in_background: false };
+    const second = await tools.get("Agent").execute("resume-2", fgParams, undefined, undefined, ctx);
+
+    expect(resumeAgent).toHaveBeenCalledTimes(1);
+    const text = resultText(second);
+    expect(text).toContain("still running");
+    expect(text).toContain("steer_subagent");
+
+    await lifecycle.get("session_shutdown")?.({}, ctx);
+  });
+
+  it("surfaces stopped status note when foreground resume parent signal aborts", async () => {
+    const { pi, tools, lifecycle } = makePi();
+    subagentsExtension(pi);
+    const ctx = makeCtx(cwd);
+    const id = await spawnSettled(tools, ctx);
+    const parentController = new AbortController();
+
+    vi.mocked(resumeAgent).mockImplementation((_s: any, _p: any, _opts: any) => {
+      parentController.abort();
+      return Promise.resolve({ text: "partial output before abort" });
+    });
+
+    const res = await tools.get("Agent").execute(
+      "resume-call",
+      { prompt: "keep going", description: "Keep going", subagent_type: "general-purpose", resume: id, run_in_background: false },
+      parentController.signal,
+      undefined,
+      ctx,
+    );
+
+    const text = resultText(res);
+    expect(text).toContain("Agent stopped");
+    expect(text).toContain("STOPPED BY THE USER");
+    expect(text).toContain("partial output before abort");
+
+    await lifecycle.get("session_shutdown")?.({}, ctx);
+  });
 });
