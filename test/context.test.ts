@@ -80,7 +80,7 @@ describe("buildParentContext", () => {
     expect(out).toContain("[User]: from blocks");
   });
 
-  it("includes compaction summaries inline in their original position", () => {
+  it("includes compaction summary and prunes pre-compaction history", () => {
     const out = buildParentContext(
       makeCtx([
         userMsg("orig question"),
@@ -88,12 +88,70 @@ describe("buildParentContext", () => {
         assistantMsg([{ type: "text", text: "follow-up" }]),
       ]),
     );
-    expect(out.indexOf("[User]: orig question"))
-      .toBeLessThan(out.indexOf("[Summary]: we discussed X"));
-    expect(out.indexOf("[Summary]: we discussed X"))
-      .toBeLessThan(out.indexOf("[Assistant]: follow-up"));
+    expect(out).not.toContain("orig question");
+    expect(out).toContain("[Summary]: we discussed X");
+    expect(out).toContain("[Assistant]: follow-up");
   });
 
+  it("preserves kept pre-compaction entries when firstKeptEntryId is specified", () => {
+    const out = buildParentContext(
+      makeCtx([
+        { id: "msg-1", type: "message", message: { role: "user", content: "dropped early msg" } },
+        { id: "msg-2", type: "message", message: { role: "assistant", content: [{ type: "text", text: "kept assistant msg" }] } },
+        { type: "compaction", summary: "we discussed previous items", firstKeptEntryId: "msg-2" },
+        { id: "msg-3", type: "message", message: { role: "user", content: "post-compaction msg" } },
+      ]),
+    );
+    expect(out).not.toContain("dropped early msg");
+    expect(out).toContain("[Summary]: we discussed previous items");
+    expect(out).toContain("[Assistant]: kept assistant msg");
+    expect(out).toContain("[User]: post-compaction msg");
+  });
+
+  it("handles multiple compactions by keeping only the latest compaction boundary", () => {
+    const out = buildParentContext(
+      makeCtx([
+        userMsg("very old turn"),
+        { type: "compaction", summary: "first compaction summary" },
+        userMsg("middle turn"),
+        { type: "compaction", summary: "second compaction summary" },
+        assistantMsg([{ type: "text", text: "latest turn" }]),
+      ]),
+    );
+    expect(out).not.toContain("very old turn");
+    expect(out).not.toContain("first compaction summary");
+    expect(out).not.toContain("middle turn");
+    expect(out).toContain("[Summary]: second compaction summary");
+    expect(out).toContain("[Assistant]: latest turn");
+  });
+
+  it("skips compaction entries with whitespace-only summaries", () => {
+    const out = buildParentContext(
+      makeCtx([
+        { type: "compaction", summary: "   \n  " },
+        assistantMsg([{ type: "text", text: "active message" }]),
+      ]),
+    );
+    expect(out).not.toContain("[Summary]");
+    expect(out).toContain("[Assistant]: active message");
+  });
+
+  it("prefers sessionManager.buildContextEntries() when available", () => {
+    const customEntries = [
+      { type: "compaction", summary: "runtime pruned summary" },
+      { type: "message", message: { role: "user", content: "runtime pruned user" } },
+    ];
+    const ctx = {
+      sessionManager: {
+        buildContextEntries: () => customEntries,
+        getBranch: () => [userMsg("should not appear from getBranch")],
+      },
+    } as unknown as ExtensionContext;
+    const out = buildParentContext(ctx);
+    expect(out).not.toContain("should not appear from getBranch");
+    expect(out).toContain("[Summary]: runtime pruned summary");
+    expect(out).toContain("[User]: runtime pruned user");
+  });
   it("skips tool_result messages — they're too verbose for inherited context", () => {
     const out = buildParentContext(
       makeCtx([
@@ -125,5 +183,54 @@ describe("buildParentContext", () => {
     );
     expect(out).toContain("[User]: question");
     expect(out).not.toContain("[Assistant]:");
+  });
+
+  it("handles assistant messages with plain string content without throwing", () => {
+    const out = buildParentContext(
+      makeCtx([
+        userMsg("hello"),
+        { type: "message", message: { role: "assistant", content: "direct string response" } },
+      ]),
+    );
+    expect(out).toContain("[User]: hello");
+    expect(out).toContain("[Assistant]: direct string response");
+  });
+
+  it("handles assistant and user messages with null, undefined, or non-array content gracefully", () => {
+    const out = buildParentContext(
+      makeCtx([
+        { type: "message", message: { role: "user", content: null } },
+        { type: "message", message: { role: "assistant", content: undefined } },
+        { type: "message", message: { role: "assistant", content: [{ type: "text", text: "valid text" }] } },
+      ]),
+    );
+    expect(out).toContain("[Assistant]: valid text");
+  });
+
+  it("includes branch_summary entries alongside compaction summaries", () => {
+    const out = buildParentContext(
+      makeCtx([
+        { type: "branch_summary", summary: "summary of branched exploration" },
+        userMsg("what happened next"),
+      ]),
+    );
+    expect(out).toContain("[Summary]: summary of branched exploration");
+    expect(out).toContain("[User]: what happened next");
+  });
+
+  it("does not re-include older compaction summaries in reverse order when firstKeptEntryId spans an earlier compaction", () => {
+    const out = buildParentContext(
+      makeCtx([
+        { id: "msg-0", type: "message", message: { role: "user", content: "epoch 0" } },
+        { id: "comp-1", type: "compaction", summary: "summary of epoch 0", firstKeptEntryId: "msg-0" },
+        { id: "msg-1", type: "message", message: { role: "user", content: "epoch 1" } },
+        { id: "comp-2", type: "compaction", summary: "summary of epoch 1", firstKeptEntryId: "comp-1" },
+        assistantMsg([{ type: "text", text: "latest reply" }]),
+      ]),
+    );
+    expect(out).toContain("[Summary]: summary of epoch 1");
+    expect(out).not.toContain("[Summary]: summary of epoch 0");
+    expect(out).toContain("[User]: epoch 1");
+    expect(out).toContain("[Assistant]: latest reply");
   });
 });
