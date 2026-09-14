@@ -3,6 +3,7 @@ import { AgentManager } from "../src/agent-manager.js";
 import {
   getGraceTurns,
   installExtensionToolScope,
+  installSessionToolController,
   resumeAgent,
   setGraceTurns,
 } from "../src/agent-runner.js";
@@ -130,6 +131,57 @@ describe("resumeAgent turn limit governance and tool restoration", () => {
 
     await resumePromise;
     expect(session.getActiveToolNames()).toEqual(["read", "bash"]);
+  });
+
+  it("restores only in-scope tools when resuming a hard-limited session with extension narrowing", async () => {
+    const { session } = createMockSession({
+      tools: ["read", "git_status", "git_commit"],
+      activeTools: [], // hard-limited state
+    });
+    const dummyLoader = {
+      getExtensions: () => ({
+        extensions: [
+          {
+            path: "/path/to/git/index.js",
+            tools: new Map([
+              ["git_status", {}],
+              ["git_commit", {}],
+            ]),
+          },
+        ],
+      }),
+    };
+    installExtensionToolScope(session as any, {
+      loader: dummyLoader as any,
+      toolNames: ["read"],
+      disallowedSet: new Set(),
+      extNames: new Set(["git"]),
+      narrowing: new Map([["git", new Set(["git_status"])]]),
+      readmitToolNames: new Set(),
+      isHardLimited: () => false,
+      hardLimitAllowedTools: () => [],
+    });
+
+    // Simulate hard limit hitting during the run:
+    session.setActiveToolsByName([]);
+    expect(session.getActiveToolNames()).toEqual([]);
+    const resumePromise = resumeAgent(session as any, "Inspect next step");
+    expect(session.getActiveToolNames()).toEqual(["read", "git_status"]);
+    await resumePromise;
+  });
+
+  it("restores only in-scope tools when resuming a hard-limited session with installSessionToolController", async () => {
+    const { session } = createMockSession({
+      tools: ["read", "bash", "edit"],
+      activeTools: [], // hard-limited state
+    });
+    installSessionToolController(session as any, {
+      inScope: () => new Set(["read", "bash"]),
+    });
+
+    const resumePromise = resumeAgent(session as any, "Inspect next step");
+    expect(session.getActiveToolNames()).toEqual(["read", "bash"]);
+    await resumePromise;
   });
 
   it("soft limit: steers at maxTurns and does not abort if finished within grace", async () => {

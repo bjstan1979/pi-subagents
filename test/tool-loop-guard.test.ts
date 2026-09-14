@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import {
   installSessionToolController,
+  isKeyInvalidatedByTarget,
   isReadOnlyShellCommand,
   isSubpathOrEqual,
   resumeAgent,
@@ -1017,5 +1018,145 @@ describe("Tool Loop Guard & Universal Session Controller", () => {
     const resSecondary = await session.agent.beforeToolCall(secondaryCall);
     expect(resSecondary?.block).toBe(true);
     expect(resSecondary?.reason).toMatch(/already executed in the preceding turn/);
+  });
+
+  it("handles large tool payloads with compact hashing while preserving consecutive failure loop blocks", async () => {
+    const { session } = createStubSession();
+    installSessionToolController(session);
+
+    const largeContent = "const x = 1;\n".repeat(500); // > 5000 chars
+    const failingWrite = {
+      toolCall: {
+        id: "w_big_1",
+        name: "write",
+        arguments: { path: "src/big.ts", content: largeContent },
+      },
+    };
+
+    // Attempt 1: allowed, then fails
+    const res1 = await session.agent.beforeToolCall(failingWrite);
+    expect(res1).toBeUndefined();
+    session._emit({
+      type: "tool_execution_start",
+      toolCallId: "w_big_1",
+      toolName: "write",
+      args: failingWrite.toolCall.arguments,
+    });
+    session._emit({
+      type: "tool_execution_end",
+      toolCallId: "w_big_1",
+      toolName: "write",
+      args: failingWrite.toolCall.arguments,
+      isError: true,
+    });
+    session._emit({ type: "turn_end" });
+
+    // Attempt 2: identical failing call
+    const failingWrite2 = {
+      toolCall: {
+        id: "w_big_2",
+        name: "write",
+        arguments: { path: "src/big.ts", content: largeContent },
+      },
+    };
+    const res2 = await session.agent.beforeToolCall(failingWrite2);
+    expect(res2).toBeUndefined();
+    session._emit({
+      type: "tool_execution_end",
+      toolCallId: "w_big_2",
+      toolName: "write",
+      args: failingWrite2.toolCall.arguments,
+      isError: true,
+    });
+    session._emit({ type: "turn_end" });
+
+    // Attempt 3: identical large failing call must be BLOCKED
+    const failingWrite3 = {
+      toolCall: {
+        id: "w_big_3",
+        name: "write",
+        arguments: { path: "src/big.ts", content: largeContent },
+      },
+    };
+    const res3 = await session.agent.beforeToolCall(failingWrite3);
+    expect(res3?.block).toBe(true);
+    expect(res3?.reason).toMatch(/failed consecutively \(2 times\)/);
+
+    // Differentiated content is NOT blocked
+    const differentWrite = {
+      toolCall: {
+        id: "w_big_diff",
+        name: "write",
+        arguments: { path: "src/big.ts", content: largeContent + "const y = 2;\n" },
+      },
+    };
+    const resDiff = await session.agent.beforeToolCall(differentWrite);
+    expect(resDiff).toBeUndefined();
+  });
+
+  it("invalidates a cached long read-only shell command after its read target changes", async () => {
+    const { session } = createStubSession();
+    installSessionToolController(session);
+    const command = `cat src/a.ts ${"x".repeat(305)}`;
+    expect(command.length).toBeGreaterThan(256);
+    expect(isReadOnlyShellCommand(command)).toBe(true);
+
+    const first = await session.agent.beforeToolCall({
+      toolCall: { id: "long-read-1", name: "bash", arguments: { command } },
+    });
+    expect(first).toBeUndefined();
+    session._emit({ type: "tool_execution_start", toolCallId: "long-read-1", toolName: "bash", args: { command } });
+    session._emit({ type: "tool_execution_end", toolCallId: "long-read-1", toolName: "bash", args: { command }, isError: false });
+    session._emit({ type: "turn_end" });
+
+    session._emit({ type: "tool_execution_end", toolCallId: "edit-a", toolName: "edit", args: { path: "src/a.ts", edits: [] }, isError: false });
+    session._emit({ type: "turn_end" });
+
+    const reread = await session.agent.beforeToolCall({
+      toolCall: { id: "long-read-2", name: "bash", arguments: { command } },
+    });
+    expect(reread).toBeUndefined();
+  });
+
+  it("isKeyInvalidatedByTarget early-exits on non-path keys and caches parsed target paths", () => {
+    // Non-path tool keys immediately return false without throwing or parsing
+    expect(isKeyInvalidatedByTarget("web_search:{\"query\":\"hello world\"}", "src/a.ts", "edit")).toBe(false);
+    expect(isKeyInvalidatedByTarget("web_extract:{\"url\":\"https://example.com\"}", "src/a.ts", "write")).toBe(false);
+    expect(isKeyInvalidatedByTarget("bash:{\"command\":\"pwd\"}", "src/a.ts", "write")).toBe(false);
+    expect(isKeyInvalidatedByTarget("invalid_colonless_key", "src/a.ts", "write")).toBe(false);
+
+    // Read tool key matches target path exactly
+    const readKey = "read:{\"path\":\"src/a.ts\"}";
+    expect(isKeyInvalidatedByTarget(readKey, "src/a.ts", "edit")).toBe(true);
+    expect(isKeyInvalidatedByTarget(readKey, "src/b.ts", "edit")).toBe(false);
+
+    // Repeated calls hit cache
+    expect(isKeyInvalidatedByTarget(readKey, "src/a.ts", "edit")).toBe(true);
+
+    // Grep scoped subpath matches
+    const grepKey = "grep:{\"path\":\"src\",\"pattern\":\"test\"}";
+    expect(isKeyInvalidatedByTarget(grepKey, "src/sub/file.ts", "write")).toBe(true);
+    expect(isKeyInvalidatedByTarget(grepKey, "docs/readme.md", "write")).toBe(false);
+
+    // Find and ls only invalidate on write, not edit
+    const findKey = "find:{\"path\":\"src\"}";
+    expect(isKeyInvalidatedByTarget(findKey, "src/new.ts", "edit")).toBe(false);
+    expect(isKeyInvalidatedByTarget(findKey, "src/new.ts", "write")).toBe(true);
+
+    // Bash and powershell targeted invalidation
+    expect(isKeyInvalidatedByTarget("bash:{\"command\":\"git status\"}", "src/a.ts", "edit")).toBe(true);
+    expect(isKeyInvalidatedByTarget("bash:{\"command\":\"git diff\"}", "src/a.ts", "write")).toBe(true);
+    expect(isKeyInvalidatedByTarget("bash:{\"command\":\"cat src/a.ts\"}", "src/a.ts", "edit")).toBe(true);
+    expect(isKeyInvalidatedByTarget("bash:{\"command\":\"cat src/b.ts\"}", "src/a.ts", "edit")).toBe(false);
+    expect(isKeyInvalidatedByTarget("bash:{\"command\":\"pwd\"}", "src/a.ts", "edit")).toBe(false);
+
+    // Null and undefined serialization in arguments produces valid JSON parseable by invalidation
+    expect(isKeyInvalidatedByTarget("read:{\"extra\":null,\"path\":\"src/a.ts\"}", "src/a.ts", "edit")).toBe(true);
+
+    // ast_grep with long paths (>256 chars) is not hashed and matches target
+    const longPath = "src/" + "a".repeat(260) + ".ts";
+    const longAstKey = `ast_grep:{"paths":["${longPath}"]}`;
+    expect(isKeyInvalidatedByTarget(longAstKey, longPath, "edit")).toBe(true);
+    expect(isKeyInvalidatedByTarget(longAstKey, "src/other.ts", "edit")).toBe(false);
   });
 });

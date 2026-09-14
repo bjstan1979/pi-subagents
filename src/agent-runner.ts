@@ -2,6 +2,7 @@
  * agent-runner.ts — Core execution engine: creates sessions, runs agents, collects results.
  */
 
+import { createHash } from "node:crypto";
 import { readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { basename, dirname, isAbsolute, join, resolve } from "node:path";
@@ -247,6 +248,12 @@ interface HardLimitController {
 
 const activeHardLimitControllers = new WeakMap<AgentSession, HardLimitController>();
 export const sessionStructuredCaptures = new WeakMap<AgentSession, StructuredCapture>();
+
+interface SessionToolScopeController {
+  inScope?: () => Set<string>;
+  renarrow?: () => void;
+}
+export const sessionToolScopeControllers = new WeakMap<AgentSession, SessionToolScopeController>();
 
 const READ_ONLY_TOOL_NAMES = new Set([
   "read",
@@ -617,18 +624,36 @@ function isModifyingTool(name: string, args?: unknown): boolean {
   }
   return MODIFYING_TOOL_NAMES.has(name);
 }
-function stableSerialize(value: unknown): string {
-  if (value === undefined) return "";
+function stableSerialize(value: unknown, keyName?: string): string {
   if (value === null) return "null";
-  if (Array.isArray(value)) return `[${value.map((v) => (v === undefined ? "null" : stableSerialize(v))).join(",")}]`;
+  if (value === undefined) return "";
+  if (typeof value === "string") {
+    if (
+      keyName !== "path" &&
+      keyName !== "filePath" &&
+      keyName !== "paths" &&
+      keyName !== "file" &&
+      keyName !== "command" &&
+      value.length > 256
+    ) {
+      const hash = createHash("sha256").update(value).digest("hex").slice(0, 16);
+      return JSON.stringify(`__hash_${value.length}_${hash}`);
+    }
+    return JSON.stringify(value);
+  }
+  if (Array.isArray(value)) {
+    return `[${value.map((item) => (item === undefined ? "null" : stableSerialize(item, keyName))).join(",")}]`;
+  }
   if (typeof value === "object") {
     try {
-      const keys = Object.keys(value as Record<string, unknown>).sort();
+      const obj = value as Record<string, unknown>;
+      const keys = Object.keys(obj).sort();
       const entries: string[] = [];
       for (const k of keys) {
-        const val = (value as Record<string, unknown>)[k];
-        if (val === undefined) continue;
-        entries.push(`${JSON.stringify(k)}:${stableSerialize(val)}`);
+        const v = obj[k];
+        if (v !== undefined) {
+          entries.push(`${JSON.stringify(k)}:${stableSerialize(v, k)}`);
+        }
       }
       return `{${entries.join(",")}}`;
     } catch {
@@ -726,40 +751,98 @@ export function getEffectiveMutationTurn(
   return loopState.lastMutatingTurn;
 }
 
+interface KeyTargetMeta {
+  prefix: string;
+  path?: string;
+  filePath?: string;
+  paths?: string[];
+  command?: string;
+}
+
+const keyTargetMetaCache = new Map<string, KeyTargetMeta | null>();
+
 export function isKeyInvalidatedByTarget(
   key: string,
   targetPath: string,
   toolName: string,
 ): boolean {
-  try {
+  let meta = keyTargetMetaCache.get(key);
+  if (meta === undefined) {
     const colonIdx = key.indexOf(":");
-    if (colonIdx < 0) return false;
+    if (colonIdx < 0) {
+      keyTargetMetaCache.set(key, null);
+      return false;
+    }
     const prefix = key.slice(0, colonIdx);
-    const parsed = JSON.parse(key.slice(colonIdx + 1));
+    if (
+      prefix !== "read" &&
+      prefix !== "ts_morph" &&
+      prefix !== "grep" &&
+      prefix !== "find" &&
+      prefix !== "ls" &&
+      prefix !== "ast_grep" &&
+      prefix !== "bash" &&
+      prefix !== "powershell"
+    ) {
+      keyTargetMetaCache.set(key, null);
+      return false;
+    }
+    try {
+      const parsed = JSON.parse(key.slice(colonIdx + 1));
+      meta = {
+        prefix,
+        path: parsed.path !== undefined ? normalizeFilePath(parsed.path) : ".",
+        filePath: parsed.filePath !== undefined ? normalizeFilePath(parsed.filePath) : undefined,
+        paths:
+          Array.isArray(parsed.paths) && parsed.paths.length > 0
+            ? parsed.paths.map((p: unknown) =>
+                typeof p === "string" ? normalizeFilePath(p) : String(p),
+              )
+            : [normalizeFilePath(parsed.path ?? ".")],
+        command: typeof parsed.command === "string" ? parsed.command : undefined,
+      };
+      if (keyTargetMetaCache.size > 1024) {
+        keyTargetMetaCache.clear();
+      }
+      keyTargetMetaCache.set(key, meta);
+    } catch {
+      keyTargetMetaCache.set(key, null);
+      return false;
+    }
+  }
 
-    if (prefix === "read") {
-      return normalizeFilePath(parsed.path) === targetPath;
+  if (!meta) return false;
+
+  const prefix = meta.prefix;
+  if (prefix === "read") {
+    return meta.path === targetPath;
+  }
+  if (prefix === "ts_morph") {
+    return meta.filePath === targetPath;
+  }
+  if (prefix === "grep") {
+    const grepPath = meta.path ?? ".";
+    return isSubpathOrEqual(targetPath, grepPath);
+  }
+  if (prefix === "find" || prefix === "ls") {
+    if (toolName !== "write") return false;
+    const dirPath = meta.path ?? ".";
+    return isSubpathOrEqual(targetPath, dirPath);
+  }
+  if (prefix === "ast_grep") {
+    const paths = meta.paths ?? ["."];
+    return paths.some((p) => isSubpathOrEqual(targetPath, p));
+  }
+  if (prefix === "bash" || prefix === "powershell") {
+    const cmd = meta.command ?? "";
+    if (cmd.includes("git status") || cmd.includes("git diff")) {
+      return true;
     }
-    if (prefix === "ts_morph") {
-      return normalizeFilePath(parsed.filePath) === targetPath;
+    if (targetPath && cmd.includes(targetPath)) {
+      return true;
     }
-    if (prefix === "grep") {
-      const grepPath = normalizeFilePath(parsed.path ?? ".");
-      return isSubpathOrEqual(targetPath, grepPath);
-    }
-    if (prefix === "find" || prefix === "ls") {
-      if (toolName !== "write") return false;
-      const dirPath = normalizeFilePath(parsed.path ?? ".");
-      return isSubpathOrEqual(targetPath, dirPath);
-    }
-    if (prefix === "ast_grep") {
-      const paths: string[] =
-        Array.isArray(parsed.paths) && parsed.paths.length > 0
-          ? parsed.paths
-          : [parsed.path ?? "."];
-      return paths.some((p) => isSubpathOrEqual(targetPath, normalizeFilePath(p)));
-    }
-  } catch {}
+    return false;
+  }
   return false;
 }
 
@@ -840,6 +923,12 @@ export function installSessionToolController(
     hardLimitAllowedTools?: () => string[];
   } = {},
 ): void {
+  if (options.inScope) {
+    const existing = sessionToolScopeControllers.get(session) ?? {};
+    existing.inScope = options.inScope;
+    sessionToolScopeControllers.set(session, existing);
+  }
+
   let loopState = sessionLoopGuardStates.get(session);
   if (!loopState) {
     loopState = {
@@ -981,9 +1070,19 @@ export function installSessionToolController(
         loopState.blockedToolKeys.clear();
       } else if (event.type === "tool_execution_start") {
         const callId = (event as any).toolCallId;
-        if (callId && (event as any).args) {
-          const args = (event as any).args;
-          loopState.pendingCalls.set(callId, { toolKey: makeToolKey(event.toolName, args), args });
+        if (callId) {
+          const pending = loopState.pendingCalls.get(callId);
+          if (pending) {
+            if (pending.args === undefined && (event as any).args !== undefined) {
+              pending.args = (event as any).args;
+            }
+          } else if ((event as any).args) {
+            const args = (event as any).args;
+            loopState.pendingCalls.set(callId, {
+              toolKey: makeToolKey(event.toolName, args),
+              args,
+            });
+          }
         }
       } else if (event.type === "tool_execution_end") {
         const toolName = event.toolName;
@@ -1163,6 +1262,10 @@ export function installExtensionToolScope(
 
   session.subscribe((event: AgentSessionEvent) => {
     if (event.type === "turn_end") renarrow();
+  });
+  sessionToolScopeControllers.set(session, {
+    inScope,
+    renarrow,
   });
 
   nestedCallGate.allows = (name) => inScope().has(name);
@@ -2020,6 +2123,12 @@ export async function runAgent(
         if (aborted) {
           return;
         }
+        if (inStructuredRetry) {
+          if (hardLimit) {
+            session.setActiveToolsByName(hardLimitAllowedTools());
+          }
+          return;
+        }
         if (turnCount >= maxTurns + graceTurns) {
           limitReached = true;
           aborted = true;
@@ -2088,6 +2197,7 @@ export async function runAgent(
   // on counts as this run's output (a fresh session, so usually 0).
   const startLen = session.messages.length;
   let structuredRetried = false;
+  let inStructuredRetry = false;
   try {
     // A signal that fired before this point never calls the listener above, and
     // pi's `session.abort()` is a no-op until a run is active — so a child whose
@@ -2100,8 +2210,12 @@ export async function runAgent(
     // the abort forwarding are still live: torn down first, a retry would be
     // unkillable.
     if (structuredCapture !== undefined && structuredCapture.json === undefined
-      && !aborted && options.signal?.aborted !== true) {
+      && options.signal?.aborted !== true) {
       structuredRetried = true;
+      inStructuredRetry = true;
+      if (aborted) {
+        aborted = false;
+      }
       if (hardLimit) {
         session.setActiveToolsByName([STRUCTURED_OUTPUT_TOOL_NAME]);
       }
@@ -2150,24 +2264,6 @@ export async function resumeAgent(
     signal?: AbortSignal;
   } = {},
 ): Promise<{ text: string; aborted?: boolean; steered?: boolean; failure?: string; structuredJson?: string }> {
-  // If active tools were emptied (e.g. by hardLimit in a previous run), restore all
-  // tools configured for this session so the resumed agent has tools available.
-  if (session.getActiveToolNames && session.getAllTools) {
-    const active = session.getActiveToolNames();
-    const all = session.getAllTools();
-    const isHardLimitedState = (active.length === 0 && all.length > 0) || (active.length === 1 && active[0] === STRUCTURED_OUTPUT_TOOL_NAME && all.length > 1);
-    if (isHardLimitedState) {
-      session.setActiveToolsByName(all.map((t) => t.name));
-    }
-  }
-
-  // Boundary for the history fallback: the session already holds prior turns,
-  // so only assistant text produced by THIS resume prompt counts as its output
-  // — a failed resume must not surface the previous turn's answer (#144).
-  const startLen = session.messages.length;
-  const collector = collectResponseText(session);
-  const cleanupAbort = forwardAbortSignal(session, options.signal);
-
   let turnCount = 0;
   const maxTurns = normalizeMaxTurns(options.maxTurns);
   const hardLimit = options.hardLimit ?? false;
@@ -2191,6 +2287,32 @@ export async function resumeAgent(
     hardLimitAllowedTools,
   });
 
+  // Restore a hard-limited session only through its recorded scope controller.
+  // The controller is registered above, so renarrow observes this fresh resume state.
+  if (session.getActiveToolNames && session.getAllTools) {
+    const active = session.getActiveToolNames();
+    const all = session.getAllTools();
+    const isHardLimitedState = (active.length === 0 && all.length > 0) || (active.length === 1 && active[0] === STRUCTURED_OUTPUT_TOOL_NAME && all.length > 1);
+    if (isHardLimitedState) {
+      const scopeCtrl = sessionToolScopeControllers.get(session);
+      if (scopeCtrl?.renarrow) {
+        scopeCtrl.renarrow();
+      } else if (scopeCtrl?.inScope) {
+        const allowed = scopeCtrl.inScope();
+        session.setActiveToolsByName(all.map((t) => t.name).filter((name) => allowed.has(name)));
+      } else {
+        session.setActiveToolsByName(all.map((t) => t.name));
+      }
+    }
+  }
+
+  // Boundary for the history fallback: the session already holds prior turns,
+  // so only assistant text produced by THIS resume prompt counts as its output
+  // — a failed resume must not surface the previous turn's answer (#144).
+  const startLen = session.messages.length;
+  const collector = collectResponseText(session);
+  const cleanupAbort = forwardAbortSignal(session, options.signal);
+
   installSessionToolController(session);
   const loopState = sessionLoopGuardStates.get(session);
   if (loopState) {
@@ -2206,6 +2328,12 @@ export async function resumeAgent(
       options.onTurnEnd?.(turnCount);
       if (maxTurns != null) {
         if (aborted) {
+          return;
+        }
+        if (inStructuredRetry) {
+          if (hardLimit) {
+            session.setActiveToolsByName(hardLimitAllowedTools());
+          }
           return;
         }
         if (turnCount >= maxTurns + graceTurns) {
@@ -2247,9 +2375,23 @@ export async function resumeAgent(
     }
   });
 
+  let structuredRetried = false;
+  let inStructuredRetry = false;
   try {
     // Already aborted: not prompted, as in `runAgent`.
     if (options.signal?.aborted !== true) await session.prompt(prompt);
+    if (structuredCapture !== undefined && structuredCapture.json === undefined
+      && options.signal?.aborted !== true) {
+      structuredRetried = true;
+      inStructuredRetry = true;
+      if (aborted) {
+        aborted = false;
+      }
+      if (hardLimit) {
+        session.setActiveToolsByName([STRUCTURED_OUTPUT_TOOL_NAME]);
+      }
+      await session.prompt(structuredRetryPrompt(structuredCapture));
+    }
   } finally {
     activeHardLimitControllers.delete(session);
     collector.unsubscribe();
@@ -2257,12 +2399,18 @@ export async function resumeAgent(
     cleanupAbort();
   }
 
+  const structuredFailure = structuredCapture !== undefined && structuredCapture.json === undefined
+    ? structuredCapture.lastError !== undefined
+      ? `The agent's StructuredOutput call did not match the required schema: ${structuredCapture.lastError}`
+      : "The agent did not report its answer through StructuredOutput."
+    : undefined;
   return {
     text: collector.getText().trim() || getLastAssistantText(session, startLen),
     aborted,
     steered: limitReached,
-    failure: finalTurnError(session, startLen),
+    failure: finalTurnError(session, startLen) ?? structuredFailure,
     ...(structuredCapture?.json !== undefined ? { structuredJson: structuredCapture.json } : {}),
+    ...(structuredRetried ? { structuredRetried } : {}),
   };
 }
 
