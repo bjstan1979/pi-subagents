@@ -18,7 +18,10 @@ import { getAgentDir } from "@earendil-works/pi-coding-agent";
 import type { MemoryScope } from "./types.js";
 
 /** Maximum lines to read from MEMORY.md */
-const MAX_MEMORY_LINES = 200;
+export const MAX_MEMORY_LINES = 200;
+
+/** Maximum characters to read from MEMORY.md to prevent prompt context bloat (~6k tokens) */
+export const MAX_MEMORY_CHARS = 25_000;
 
 /**
  * Returns true if a name contains characters not allowed in agent/skill names.
@@ -109,11 +112,43 @@ export function readMemoryIndex(memoryDir: string): string | undefined {
   const content = safeReadFile(memoryFile);
   if (content === undefined) return undefined;
 
-  const lines = content.split("\n");
-  if (lines.length > MAX_MEMORY_LINES) {
-    return lines.slice(0, MAX_MEMORY_LINES).join("\n") + "\n... (truncated at 200 lines)";
+  let truncatedLines = false;
+  let truncatedChars = false;
+  let result = content;
+
+  const lines = result.split("\n");
+  const effectiveLineCount = lines.length > 0 && lines[lines.length - 1] === "" ? lines.length - 1 : lines.length;
+  if (effectiveLineCount > MAX_MEMORY_LINES) {
+    result = lines.slice(0, MAX_MEMORY_LINES).join("\n");
+    truncatedLines = true;
   }
-  return content;
+
+  if (result.length > MAX_MEMORY_CHARS) {
+    let cutPoint = result.lastIndexOf("\n", MAX_MEMORY_CHARS);
+    if (cutPoint < MAX_MEMORY_CHARS / 2) {
+      cutPoint = MAX_MEMORY_CHARS;
+    }
+    if (cutPoint > 0 && result[cutPoint - 1] === "\r") {
+      cutPoint--;
+    }
+    if (cutPoint > 0 && result.charCodeAt(cutPoint - 1) >= 0xd800 && result.charCodeAt(cutPoint - 1) <= 0xdbff) {
+      cutPoint--;
+    }
+    result = result.slice(0, cutPoint);
+    truncatedChars = true;
+  }
+
+  if (truncatedLines && truncatedChars) {
+    return `${result}\n... (truncated at ${MAX_MEMORY_LINES} lines / ${MAX_MEMORY_CHARS} chars)`;
+  }
+  if (truncatedLines) {
+    return `${result}\n... (truncated at ${MAX_MEMORY_LINES} lines)`;
+  }
+  if (truncatedChars) {
+    return `${result}\n... (truncated at ${MAX_MEMORY_CHARS} chars)`;
+  }
+
+  return result;
 }
 
 /**
@@ -141,7 +176,7 @@ This memory persists across sessions. Use it to build up knowledge over time.`;
   const instructions = `
 
 ## Memory Instructions
-- MEMORY.md is an index file — keep it concise (under 200 lines). Lines after 200 are truncated.
+- MEMORY.md is an index file — keep it concise (under 200 lines and 25,000 characters). Content beyond limits is truncated.
 - Store detailed memories in separate files within ${memoryDir}/ and link to them from MEMORY.md.
 - Each memory file should use this frontmatter format:
   \`\`\`markdown

@@ -13,7 +13,7 @@ vi.mock("node:os", async (importOriginal) => {
   return { ...actual, homedir: mockHomedir };
 });
 
-import { buildMemoryBlock, buildReadOnlyMemoryBlock, ensureMemoryDir, isSymlink, isUnsafeName, readMemoryIndex, resolveMemoryDir, safeReadFile } from "../src/memory.js";
+import { buildMemoryBlock, buildReadOnlyMemoryBlock, ensureMemoryDir, isSymlink, isUnsafeName, MAX_MEMORY_CHARS, MAX_MEMORY_LINES, readMemoryIndex, resolveMemoryDir, safeReadFile } from "../src/memory.js";
 
 describe("memory", () => {
   let tmpDir: string;
@@ -223,7 +223,79 @@ describe("memory", () => {
       const result = readMemoryIndex(tmpDir)!;
       expect(result).toContain("Line 200");
       expect(result).not.toContain("Line 201");
-      expect(result).toContain("truncated at 200 lines");
+      expect(MAX_MEMORY_LINES).toBe(200);
+      expect(result).toContain(`truncated at ${MAX_MEMORY_LINES} lines`);
+    });
+
+    it("truncates content beyond 25,000 characters when lines count is low", () => {
+      // Single 40,000-character line (well under 200 lines)
+      const longContent = "A".repeat(40_000);
+      writeFileSync(join(tmpDir, "MEMORY.md"), longContent);
+      const result = readMemoryIndex(tmpDir)!;
+      expect(result.length).toBeLessThan(40_000);
+      expect(result).toContain("truncated at 25000 chars");
+      expect(result.slice(0, MAX_MEMORY_CHARS)).toBe("A".repeat(MAX_MEMORY_CHARS));
+    });
+
+    it("truncates content at newline boundary before 25,000 characters when possible", () => {
+      // 100 lines of 300 characters = 30,000 chars (> 25,000 chars, < 200 lines)
+      const lines = Array.from({ length: 100 }, (_, i) => `Line ${i + 1}: ${"x".repeat(300)}`);
+      writeFileSync(join(tmpDir, "MEMORY.md"), lines.join("\n"));
+      const result = readMemoryIndex(tmpDir)!;
+      expect(result).toContain("truncated at 25000 chars");
+      expect(result.length).toBeLessThanOrEqual(MAX_MEMORY_CHARS + 50);
+      // Ensure it preserved line integrity without mid-line cut
+      expect(result).toMatch(/Line \d+: x{300}\n/);
+    });
+
+    it("truncates content exceeding both 200 lines and 25,000 characters", () => {
+      // 300 lines of 200 characters = 60,000 chars
+      const lines = Array.from({ length: 300 }, (_, i) => `Line ${i + 1}: ${"y".repeat(200)}`);
+      writeFileSync(join(tmpDir, "MEMORY.md"), lines.join("\n"));
+      const result = readMemoryIndex(tmpDir)!;
+      expect(result).toContain("truncated at 200 lines / 25000 chars");
+      expect(result.length).toBeLessThanOrEqual(MAX_MEMORY_CHARS + 60);
+    });
+
+    it("does not falsely truncate a file with exactly 200 lines ending with a trailing newline", () => {
+      // 200 lines ending with trailing \n (standard POSIX text)
+      const text = Array.from({ length: 200 }, (_, i) => `Line ${i + 1}`).join("\n") + "\n";
+      writeFileSync(join(tmpDir, "MEMORY.md"), text);
+      const result = readMemoryIndex(tmpDir)!;
+      expect(result).not.toContain("truncated");
+      expect(result).toContain("Line 200");
+    });
+
+    it("does not falsely truncate exactly 200 CRLF-terminated lines", () => {
+      const text = Array.from({ length: MAX_MEMORY_LINES }, (_, i) => `CRLF ${i + 1}`).join("\r\n") + "\r\n";
+      writeFileSync(join(tmpDir, "MEMORY.md"), text);
+      const result = readMemoryIndex(tmpDir)!;
+      expect(result).toBe(text);
+      expect(result).not.toContain("truncated");
+    });
+
+    it("does not retain a dangling CR at the CRLF character-limit boundary", () => {
+      const text = Array.from({ length: 100 }, () => "x".repeat(300)).join("\r\n");
+      writeFileSync(join(tmpDir, "MEMORY.md"), text);
+      const result = readMemoryIndex(tmpDir)!;
+      const base = result.split("\n... (truncated at")[0];
+      expect(result).toContain(`truncated at ${MAX_MEMORY_CHARS} chars`);
+      expect(base.endsWith("\r")).toBe(false);
+    });
+
+    it("preserves UTF-16 surrogate pairs and avoids severing high surrogates when truncating chars", () => {
+      // 24,999 'A's followed by a 4-byte emoji 🚀 (surrogate pair \uD83D\uDE80)
+      const content = "A".repeat(MAX_MEMORY_CHARS - 1) + "🚀";
+      writeFileSync(join(tmpDir, "MEMORY.md"), content);
+      const result = readMemoryIndex(tmpDir)!;
+      expect(result).toContain(`truncated at ${MAX_MEMORY_CHARS} chars`);
+      // Extracted base slice should not end with an orphaned high surrogate
+      const truncatedBase = result.split("\n... (truncated at")[0];
+      const lastCharCode = truncatedBase.charCodeAt(truncatedBase.length - 1);
+      const isHighSurrogate = lastCharCode >= 0xd800 && lastCharCode <= 0xdbff;
+      expect(isHighSurrogate).toBe(false);
+      // Entire emoji was omitted rather than severed
+      expect(truncatedBase.length).toBe(MAX_MEMORY_CHARS - 1);
     });
   });
 

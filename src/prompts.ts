@@ -3,6 +3,8 @@
  */
 
 import type { AgentConfig, EnvInfo } from "./types.js";
+/** Maximum characters allowed for injected memory block in system prompt (~8k tokens). */
+export const MAX_MEMORY_BLOCK_CHARS = 32_000;
 
 /** Extra sections to inject into the system prompt (memory, skills, etc.). */
 export interface PromptExtras {
@@ -89,7 +91,15 @@ Return only the answer, in exactly the shape the prompt asks for — no preamble
   // Build optional extras suffix
   const extraSections: string[] = [];
   if (extras?.memoryBlock) {
-    extraSections.push(extras.memoryBlock);
+    let memoryBlock = extras.memoryBlock;
+    if (memoryBlock.length > MAX_MEMORY_BLOCK_CHARS) {
+      let cutPoint = MAX_MEMORY_BLOCK_CHARS;
+      if (cutPoint > 0 && memoryBlock.charCodeAt(cutPoint - 1) >= 0xd800 && memoryBlock.charCodeAt(cutPoint - 1) <= 0xdbff) {
+        cutPoint--;
+      }
+      memoryBlock = `${memoryBlock.slice(0, cutPoint)}\n... (memory block truncated to ${MAX_MEMORY_BLOCK_CHARS} chars)`;
+    }
+    extraSections.push(memoryBlock);
   }
   if (extras?.skillBlocks?.length) {
     for (const skill of extras.skillBlocks) {

@@ -1,6 +1,6 @@
 import { beforeEach, describe, expect, it } from "vitest";
 import { getAgentConfig, registerAgents } from "../src/agent-types.js";
-import { buildAgentPrompt } from "../src/prompts.js";
+import { buildAgentPrompt, MAX_MEMORY_BLOCK_CHARS } from "../src/prompts.js";
 import type { AgentConfig, EnvInfo } from "../src/types.js";
 
 const env: EnvInfo = {
@@ -241,6 +241,30 @@ describe("buildAgentPrompt", () => {
     expect(prompt).toContain("<sub_agent_context>");
     expect(prompt).toContain("Agent Memory");
     expect(prompt).toContain("Custom instructions.");
+  });
+
+  it("truncates oversized memory blocks defensively at MAX_MEMORY_BLOCK_CHARS", () => {
+    const config = getDefaultConfig("general-purpose");
+    const oversizedMemory = "M".repeat(50_000);
+    const extras = { memoryBlock: oversizedMemory };
+    const prompt = buildAgentPrompt(config, "/workspace", env, undefined, extras);
+    expect(prompt.length).toBeLessThan(50_000);
+    expect(MAX_MEMORY_BLOCK_CHARS).toBe(32_000);
+    expect(prompt).toContain(`memory block truncated to ${MAX_MEMORY_BLOCK_CHARS} chars`);
+  });
+
+  it("preserves UTF-16 surrogate pairs and avoids severing high surrogates in buildAgentPrompt", () => {
+    const config = getDefaultConfig("general-purpose");
+    const oversizedMemory = "M".repeat(MAX_MEMORY_BLOCK_CHARS - 1) + "🚀" + "tail";
+    const extras = { memoryBlock: oversizedMemory };
+    const prompt = buildAgentPrompt(config, "/workspace", env, undefined, extras);
+    expect(prompt).toContain(`memory block truncated to ${MAX_MEMORY_BLOCK_CHARS} chars`);
+    const marker = `\n... (memory block truncated to ${MAX_MEMORY_BLOCK_CHARS} chars)`;
+    const markerIdx = prompt.indexOf(marker);
+    expect(markerIdx).toBeGreaterThan(-1);
+    const lastCharCodeBeforeMarker = prompt.charCodeAt(markerIdx - 1);
+    const isHighSurrogate = lastCharCodeBeforeMarker >= 0xd800 && lastCharCodeBeforeMarker <= 0xdbff;
+    expect(isHighSurrogate).toBe(false);
   });
 
   it("injects preloaded skill blocks", () => {
