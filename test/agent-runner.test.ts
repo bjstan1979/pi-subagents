@@ -2821,6 +2821,24 @@ describe("agent-runner turn limits", () => {
     expect(result.structuredJson).toBe(JSON.stringify({ answer: "recovered" }));
   });
 
+  it("vetoes nested executeTool calls at the hard ceiling and restores the saved scope on resume", async () => {
+    vi.mocked(getConfig).mockReturnValue(makeConfig({ extensions: true }));
+    withExtensions({ "/ext/ok.ts": ["ok_ext"] });
+    const { session } = await runWithTurns(5, { maxTurns: 5, hardLimit: true }, makeAgentConfig({ extensions: true }));
+    const factories = lastLoaderOpts().extensionFactories as Array<{ name: string; factory: (ext: unknown) => void }>;
+    const gate = factories.find((f) => f.name === "pi-subagents-scope");
+    expect(gate).toBeDefined();
+    let handler: ((event: { toolName: string }) => unknown) | undefined;
+    gate!.factory({ on: (_name: string, fn: typeof handler) => { handler = fn; } });
+    // Calls made by codemode bypass beforeToolCall, but not this extension gate.
+    expect(handler!({ toolName: "ok_ext" })).toMatchObject({ block: true });
+    session.prompt.mockImplementation(async () => {
+      expect(handler!({ toolName: "ok_ext" })).toBeUndefined();
+      expect(handler!({ toolName: "outside_scope" })).toMatchObject({ block: true });
+    });
+    await resumeAgent(session as any, "continue", { hardLimit: true, maxTurns: 5 });
+  });
+
   it("does not allow extension scoping to re-enable extension tools once hardLimit is active", async () => {
     vi.mocked(getConfig).mockReturnValue(makeConfig({ extensions: true }));
     withExtensions({ "/ext/ok.ts": ["ok_ext"] });

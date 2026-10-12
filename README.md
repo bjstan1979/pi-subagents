@@ -341,7 +341,7 @@ All fields are optional — sensible defaults for everything.
 | `model` | inherit parent | Model — `provider/modelId` or fuzzy name (`"haiku"`, `"sonnet"`). Resolved tolerantly (`.`/`-` and a trailing date stamp are interchangeable) and falls back to the same model under another provider if the named one doesn't have it |
 | `thinking` | inherit | off, minimal, low, medium, high, xhigh, max — actual availability depends on your pi version and model; pi clamps unsupported levels down |
 | `max_turns` | unlimited | Max agentic turns before graceful shutdown. `0` or omit for unlimited |
-| `hard_limit` | `false` | At `max_turns`, disable all tools and require a final answer immediately instead of allowing grace turns |
+| `hard_limit` | `false` | At `max_turns`, veto exploration tools during the final-answer grace phase; retain only `StructuredOutput` when configured |
 | `persist_session` | `subagents.json` `rememberAgents` (default `true`) | Persist this subagent as a normal pi session instead of keeping the session in memory only; overrides the `rememberAgents` project default in both directions. It records its spawning session as parent, so it nests under it in `/resume`. The subagent's `.output` transcript is still written either way unless `output_transcript: false` |
 | `output_transcript` | `true` (or `subagents.json` `outputTranscript`) | Write this subagent's `.output` transcript; when set, overrides the `subagents.json` `outputTranscript` default. Set `false` to write no transcript file or path. Governs only the transcript — independent of `persist_session`, `isolation: worktree`, and `memory:` |
 | `session_dir` | pi default | Optional session directory when `persist_session: true`; omitted uses pi's normal session location, and relative paths resolve from the agent cwd. A session outside the parent's session directory (this override, or `isolation: worktree`) is listed separately, so it shows as a root instead of nesting |
@@ -352,7 +352,7 @@ All fields are optional — sensible defaults for everything.
 | `isolated` | `false` | Hermetic specialist mode: forces `extensions: false` + `skills: false` + drops `ext:` selectors. Only built-in tools. Distinct from `isolation: worktree` (filesystem) |
 | `enabled` | `true` | Set to `false` to disable an agent (useful for hiding a default agent per-project) |
 
-Frontmatter is authoritative. If an agent file sets `model`, `thinking`, `max_turns`, `inherit_context`, `run_in_background`, `isolated`, or `isolation`, those values are locked for that agent. `Agent` tool parameters only fill fields the agent config leaves unspecified. Other spawn paths differ per field:
+Frontmatter is authoritative. If an agent file sets `model`, `thinking`, `max_turns`, `hard_limit`, `inherit_context`, `run_in_background`, `isolated`, or `isolation`, those values are locked for that agent. `Agent` tool parameters only fill fields the agent config leaves unspecified. Other spawn paths differ per field:
 
 - `isolated` holds on every spawn path, including `@handle` mentions, workflows and [cross-extension RPC](https://github.com/tintinweb/pi-subagents/blob/master/docs/rpc.md).
 - `isolation` holds on every path except workflows: as in Claude Code, only the script's `agent()` option decides there.
@@ -450,6 +450,7 @@ Launch a sub-agent.
 | `model` | string | no | Model — `provider/modelId` or fuzzy name (`"haiku"`, `"sonnet"`). Resolved tolerantly (`.`/`-` and a trailing date stamp interchangeable) with provider fallback |
 | `thinking` | string | no | Thinking level: off, minimal, low, medium, high, xhigh, max (availability depends on pi version and model) |
 | `max_turns` | number | no | Max agentic turns. Omit for unlimited (default) |
+| `hard_limit` | boolean | no | Veto exploration tools at the ceiling; default `false`. Forwarded through spawn, resume, nested delegation and scheduling |
 | `run_in_background` | boolean | no | Defaults to `true`; `false` blocks and returns the result inline, until [`ctrl+b`](#sending-a-foreground-agent-to-the-background) hands it to the background |
 | `resume` | string | no | Agent ID to resume a previous session |
 | `isolated` | boolean | no | No extension/MCP tools |
@@ -587,7 +588,7 @@ The default remains a soft limit:
 2. Up to 5 grace turns to finish cleanly
 3. Hard abort only after the grace period
 
-Set `hard_limit: true` in agent frontmatter or an `Agent` call to switch modes. At `max_turns`, the session immediately disables every tool and asks for the final answer; the normal grace-turn tool calls are not available.
+Set `hard_limit: true` in agent frontmatter or an `Agent` call to switch modes. At `max_turns`, the session disables and vetoes exploration tools (including nested `executeTool` calls) and asks for the final answer. `StructuredOutput` remains available when configured; valid capture terminates the turn. Grace-turn exhaustion aborts once, including zero grace. One bounded structured-output recovery prompt is allowed after a ceiling abort, but never after external cancellation. Explicit resume resets capture/guard escalation and restores only the saved permitted tool scope. Workflow `agent()` accepts `maxTurns`/`max_turns` and `hardLimit`/`hard_limit`, including resumed calls.
 
 | Status | Meaning | Icon |
 |--------|---------|------|

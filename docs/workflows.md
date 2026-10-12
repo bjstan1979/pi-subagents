@@ -6,6 +6,10 @@ The thing worth understanding up front is that **you do not write these — the 
 
 For the tool's parameter table and where it sits among the other tools, see [`README.md`](../README.md#subagentworkflow).
 
+## Local turn-ceiling options
+
+`agent(prompt, { maxTurns: 5, hardLimit: true })` forwards the ceiling through the worker/runtime/host to both spawn and explicit resume. Snake-case aliases `max_turns` and `hard_limit` are also supported. Agent frontmatter remains authoritative. Hard mode vetoes exploration tools at the ceiling while preserving configured structured capture; it does not introduce autonomous continuation. These contracts and their tests remain present even when workflows are disabled in deployment settings.
+
 ## What a workflow is
 
 Until workflows existed, the only way to run several agents at once was to name them one by one in a single message. That is fine for three agents you already know about. It does not work for *"audit every route file in this repo"*, where the list only exists once something has gone and looked.

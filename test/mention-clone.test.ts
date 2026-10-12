@@ -144,6 +144,20 @@ describe("cloning the conversation", () => {
     expect(inMemory).toHaveBeenCalledWith("/repo", undefined, BRANCH);
   });
 
+  it("seeds only the selected branch including compaction, never an alternate leaf", async () => {
+    const compactedBranch = [
+      ...BRANCH,
+      { type: "compaction", id: "c1", parentId: "e2", summary: "selected summary", firstKeptEntryId: "e2", tokensBefore: 9000 },
+      { type: "message", id: "selected", parentId: "c1", message: { role: "user", content: "selected continuation" } },
+    ];
+    const getEntries = vi.fn(() => [...compactedBranch, { type: "message", id: "other", parentId: "e1", message: { role: "user", content: "wrong leaf" } }]);
+    cloneSession(callsAgent());
+    const result = await runMentionClone(opts({ ctx: mainCtx({ sessionManager: { getBranch: () => compactedBranch, getEntries } }) }));
+    expect(result).toEqual({ spawned: true });
+    expect(inMemory).toHaveBeenCalledWith("/repo", undefined, compactedBranch);
+    expect(getEntries).not.toHaveBeenCalled();
+  });
+
   it("takes the conversation from memory, never from the session file", async () => {
     // SessionManager withholds every write until the first assistant message,
     // so a file-based copy is empty for the whole of the first turn — which is

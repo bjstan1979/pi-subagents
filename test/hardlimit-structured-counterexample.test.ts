@@ -77,6 +77,7 @@ function createMockSession() {
       { name: "bash", description: "run bash" },
       { name: STRUCTURED_OUTPUT_TOOL_NAME, description: "structured output" },
     ]),
+    getToolDefinition: vi.fn(() => ({ defaultActive: true })),
     setSessionName: vi.fn(),
     bindExtensions: vi.fn(async () => {}),
     steer: vi.fn(async () => {}),
@@ -95,6 +96,7 @@ function createMockSession() {
 
 const ctx = {
   cwd: "/workspace",
+  isProjectTrusted: () => true,
   getSystemPrompt: () => "You are an agent",
   model: { id: "test-model" },
   modelRegistry: { find: vi.fn(), getAvailable: vi.fn(() => []), runtime: undefined },

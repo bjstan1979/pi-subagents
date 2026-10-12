@@ -73,6 +73,7 @@ function createMockSession() {
       { name: "read", description: "read file" },
       { name: "bash", description: "run bash" },
     ]),
+    getToolDefinition: vi.fn(() => ({ defaultActive: true })),
     setSessionName: vi.fn(),
     bindExtensions: vi.fn(async () => {}),
     steer: vi.fn(async () => {}),
@@ -91,6 +92,7 @@ function createMockSession() {
 
 const ctx = {
   cwd: "/workspace",
+  isProjectTrusted: () => true,
   getSystemPrompt: () => "You are an agent",
   model: { id: "test-model" },
   modelRegistry: { find: vi.fn(), getAvailable: vi.fn(() => []), runtime: undefined },

@@ -38,6 +38,7 @@ function createMockSession(options: {
     setActiveToolsByName: vi.fn((names: string[]) => {
       activeToolNames = [...names];
     }),
+    getToolDefinition: vi.fn(() => ({ defaultActive: true })),
     getAllTools: vi.fn(() => allToolNames.map((name) => ({ name }))),
     agent: { beforeToolCall: undefined },
     setSessionName: vi.fn(),
@@ -116,6 +117,7 @@ describe("resumeAgent turn limit governance and tool restoration", () => {
       extNames: new Set(),
       narrowing: new Map(),
       readmitToolNames: new Set(),
+      nestedCallGate: {},
       isHardLimited: () => false,
       hardLimitAllowedTools: () => [],
     });
@@ -158,6 +160,7 @@ describe("resumeAgent turn limit governance and tool restoration", () => {
       extNames: new Set(["git"]),
       narrowing: new Map([["git", new Set(["git_status"])]]),
       readmitToolNames: new Set(),
+      nestedCallGate: {},
       isHardLimited: () => false,
       hardLimitAllowedTools: () => [],
     });
