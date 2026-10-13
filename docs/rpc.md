@@ -1,5 +1,7 @@
 # Driving subagents from another extension
 
+Managed callback lifecycle and revisioned notifications are described in [managed-continuations.md](managed-continuations.md). `subagents:rpc:consume` additionally accepts optional `resultRevision` (positive integer): consuming an older published revision never suppresses a newer result. Lifecycle completion data and persisted records include `resultRevision` and `executionEpoch`.
+
 Another pi extension can spawn a subagent, listen for subagent completion, read the result and stop the run — all over the `pi.events` bus, without importing this package directly. Four request/reply channels (`subagents:rpc:ping`, `subagents:rpc:spawn`, `subagents:rpc:stop`, `subagents:rpc:consume`), eleven lifecycle events, and one in-process registry at `Symbol.for("pi-subagents:manager")`.
 
 The thing worth understanding up front is that **the bus is in-process.** Every "RPC" call here is a synchronous `pi.events.emit` into the same event loop, and every reply comes back the same way. That single fact explains most of what follows: why `signal` and the `on*` callbacks work on a spawn payload at all, why a `consume` fired inside a `subagents:completed` handler lands *before* the notification decision has been made, and why none of this survives a real process boundary.

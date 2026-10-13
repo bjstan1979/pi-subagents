@@ -49,7 +49,7 @@ export interface SpawnCapable {
    * completion notification — what `get_subagent_result` does when it returns
    * one. False when there is no such agent, or it has not settled yet.
    */
-  consumeResult(id: string): boolean;
+  consumeResult(id: string, resultRevision?: number): boolean;
 }
 
 export interface RpcDeps {
@@ -188,9 +188,11 @@ export function registerRpcHandlers(deps: RpcDeps): RpcHandle {
   // notification for that same result is not delivered on top of it and does
   // not cost the parent a turn. Deliberately outside the ping version
   // handshake: an extension built against protocol v2 simply never calls it.
-  const unsubConsume = handleRpc<{ requestId: string; agentId: string }>(
-    events, "subagents:rpc:consume", ({ agentId }) => {
-      if (!manager.consumeResult(agentId)) throw new Error("Agent not found or still running");
+  const unsubConsume = handleRpc<{ requestId: string; agentId: string; resultRevision?: number }>(
+    events, "subagents:rpc:consume", ({ agentId, resultRevision }) => {
+      if (resultRevision !== undefined && (!Number.isInteger(resultRevision) || resultRevision < 1)) throw new Error("Invalid result revision");
+      const consumed = resultRevision === undefined ? manager.consumeResult(agentId) : manager.consumeResult(agentId, resultRevision);
+      if (!consumed) throw new Error("Agent not found or still running");
     },
   );
 

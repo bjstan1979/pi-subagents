@@ -28,6 +28,7 @@ vi.mock("../src/output-file.js", async () => {
 
 import { resumeAgent, runAgent } from "../src/agent-runner.js";
 import subagentsExtension from "../src/index.js";
+import type { ManagedContinuationEndpointV1 } from "../src/managed-continuation.js";
 import { ensureOutputFile, streamToOutputFile, writeInitialEntry } from "../src/output-file.js";
 
 function makePi() {
@@ -142,6 +143,63 @@ describe("Agent tool — background resume wiring", () => {
     await new Promise((r) => setTimeout(r, 0));
     return id;
   }
+
+  it("revision1 consumption cannot suppress autonomous revision2 and snapshots bypass finalized join state", async () => {
+    const { pi, tools, lifecycle } = makePi();
+    subagentsExtension(pi);
+    const ctx = makeCtx(cwd);
+    session.sessionManager = { getCwd: () => cwd, getSessionFile: () => undefined };
+    session.sendCustomMessage = vi.fn(async () => {});
+    vi.mocked(runAgent).mockImplementationOnce(async (_ctx, _type, _prompt, options) => {
+      options.onSessionReady?.(session, { maxTurns: 2, hardLimit: true });
+      options.onSessionCreated?.(session);
+      return { responseText: "INITIAL_FINAL", session, aborted: false, steered: false };
+    });
+    const id = await spawnSettled(tools, ctx);
+    await tools.get("get_subagent_result").execute("consume-initial", { agent_id: id }, undefined, undefined, ctx);
+    const registry = (globalThis as unknown as Record<symbol, { endpoints: WeakMap<object, ManagedContinuationEndpointV1> }>)[Symbol.for("pi.managed-continuation.registry.v1")];
+    const endpoint = registry.endpoints.get(session.sessionManager)!;
+    const lease = endpoint.acquire("bg-task", "notification-proof");
+    vi.mocked(resumeAgent).mockImplementationOnce(async (_session, _prompt, options) => { await options.execute?.(); return { text: "CALLBACK_FINAL" }; });
+    const receipt = endpoint.admit({ deliveryIds: ["notification-proof:terminal"], message: { customType: "bg-task", content: "done", display: true }, options: { triggerTurn: true }, leases: [lease] });
+    await receipt.completedPromise;
+    lease.release("complete");
+    await new Promise(resolve => setTimeout(resolve, 450));
+    const sends = vi.mocked(pi.sendMessage).mock.calls.map(call => call[0].content);
+    expect(sends.some(content => content.includes("CALLBACK_FINAL") && content.includes("<result-revision>2</result-revision>"))).toBe(true);
+    expect(sends.some(content => content.includes("INITIAL_FINAL"))).toBe(false);
+    await lifecycle.get("session_shutdown")?.({}, ctx);
+  });
+
+  it.each([true, false])("initial group snapshot survives autonomous completion (before batch finalization: %s)", async beforeBatch => {
+    const { pi, tools, lifecycle } = makePi(); subagentsExtension(pi); const ctx = makeCtx(cwd);
+    const childA = session;
+    childA.sessionManager = { getCwd: () => cwd, getSessionFile: () => undefined };
+    childA.sendCustomMessage = vi.fn(async () => {});
+    let finishB!: () => void;
+    vi.mocked(runAgent).mockImplementationOnce(async (_ctx, _type, _prompt, options) => {
+      options.onSessionReady?.(childA, { hardLimit: false }); options.onSessionCreated?.(childA);
+      return { responseText: "A_INITIAL", session: childA, aborted: false, steered: false };
+    }).mockImplementationOnce(async () => {
+      await new Promise<void>(resolve => { finishB = resolve; });
+      return { responseText: "B_INITIAL", session: { dispose: vi.fn() } as any, aborted: false, steered: false };
+    });
+    const tool = tools.get("Agent");
+    await tool.execute("a", { prompt: "a", description: "A", subagent_type: "general-purpose", run_in_background: true }, undefined, undefined, ctx);
+    await tool.execute("b", { prompt: "b", description: "B", subagent_type: "general-purpose", run_in_background: true }, undefined, undefined, ctx);
+    await new Promise(resolve => setTimeout(resolve, beforeBatch ? 0 : 150));
+    const registry = (globalThis as unknown as Record<symbol, { endpoints: WeakMap<object, ManagedContinuationEndpointV1> }>)[Symbol.for("pi.managed-continuation.registry.v1")];
+    const endpoint = registry.endpoints.get(childA.sessionManager)!;
+    const lease = endpoint.acquire("bg", "group-proof");
+    vi.mocked(resumeAgent).mockResolvedValueOnce({ text: "A_CALLBACK" });
+    await endpoint.admit({ deliveryIds: ["group-proof"], message: { customType: "bg", content: "done", display: true }, options: { triggerTurn: true }, leases: [lease] }).completedPromise;
+    lease.release("done"); finishB();
+    await new Promise(resolve => setTimeout(resolve, 450));
+    const sends = vi.mocked(pi.sendMessage).mock.calls.map(call => call[0].content);
+    expect(sends.filter(content => content.includes("A_CALLBACK"))).toHaveLength(1);
+    expect(sends.filter(content => content.includes("A_INITIAL") && content.includes("B_INITIAL"))).toHaveLength(1);
+    await lifecycle.get("session_shutdown")?.({}, ctx);
+  });
 
   // A background spawn deliberately omits the tool-call signal — that signal
   // aborts when the parent turn is interrupted (user Esc), which must not reach

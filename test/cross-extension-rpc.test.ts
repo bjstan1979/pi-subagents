@@ -293,6 +293,26 @@ describe("cross-extension RPC", () => {
   // --- consume ---
 
   describe("consume RPC", () => {
+    it("passes an explicit revision as a second argument", async () => {
+      registerRpcHandlers(deps);
+      const reply = vi.fn();
+      events.on("subagents:rpc:consume:reply:revision", reply);
+      events.emit("subagents:rpc:consume", { requestId: "revision", agentId: "agent-42", resultRevision: 2 });
+      await vi.waitFor(() => expect(reply).toHaveBeenCalled());
+      expect(reply).toHaveBeenCalledWith({ success: true });
+      expect(manager.consumeResult).toHaveBeenCalledExactlyOnceWith("agent-42", 2);
+    });
+
+    it.each([0, -1, 1.5, "2", null])("rejects invalid revision %s before consumption", async resultRevision => {
+      registerRpcHandlers(deps);
+      const reply = vi.fn();
+      events.on("subagents:rpc:consume:reply:invalid", reply);
+      events.emit("subagents:rpc:consume", { requestId: "invalid", agentId: "agent-42", resultRevision });
+      await vi.waitFor(() => expect(reply).toHaveBeenCalled());
+      expect(reply).toHaveBeenCalledWith({ success: false, error: "Invalid result revision" });
+      expect(manager.consumeResult).not.toHaveBeenCalled();
+    });
+
     it("returns success when the result is consumed", async () => {
       registerRpcHandlers(deps);
       const reply = vi.fn();

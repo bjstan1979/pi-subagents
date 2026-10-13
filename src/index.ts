@@ -193,6 +193,7 @@ function formatTaskNotification(record: AgentRecord, resultMaxLen: number, showC
   return [
     `<task-notification>`,
     `<task-id>${record.id}</task-id>`,
+    `<result-revision>${record.resultRevision ?? 1}</result-revision>`,
     record.toolCallId ? `<tool-use-id>${escapeXml(record.toolCallId)}</tool-use-id>` : null,
     record.outputFile ? `<output-file>${escapeXml(record.outputFile)}</output-file>` : null,
     `<status>${escapeXml(status)}</status>`,
@@ -234,6 +235,7 @@ function buildNotificationDetails(record: AgentRecord, resultMaxLen: number, act
 
   return {
     id: record.id,
+    resultRevision: record.resultRevision ?? 1,
     description: record.description,
     status: record.status,
     toolUses: record.toolUses,
@@ -475,7 +477,10 @@ export default function (pi: ExtensionAPI) {
 
   // ---- Individual nudge helper (async join mode) ----
   function emitIndividualNudge(record: AgentRecord) {
-    if (record.resultConsumed) return;  // re-check at send time
+    if (pendingBatchCompletions.get(record.id)?.resultRevision === record.resultRevision) pendingBatchCompletions.delete(record.id);
+    const live = manager.getRecord(record.id);
+    if ((live?.consumedRevision ?? 0) >= (record.resultRevision ?? 1)) return;
+    if (live?.resultConsumed && live.resultRevision === record.resultRevision) return;
 
     const notification = formatTaskNotification(record, 500, showCost);
     const footer = record.outputFile ? `\nFull transcript available at: ${record.outputFile}` : '';
@@ -492,19 +497,24 @@ export default function (pi: ExtensionAPI) {
     agentActivity.delete(record.id);
     widget.markFinished(record.id);
     fleet.onAgentFinished(record.id);
-    scheduleNudge(record.id, () => emitIndividualNudge(record));
+    const snapshot = { ...record, lifetimeUsage: { ...record.lifetimeUsage } };
+    scheduleNudge(`${record.id}:${record.resultRevision ?? 1}`, () => emitIndividualNudge(snapshot));
     widget.update();
   }
 
   // ---- Group join manager ----
   const groupJoin = new GroupJoinManager(
     (records, partial) => {
+      records = records.map(record => ({ ...record, lifetimeUsage: { ...record.lifetimeUsage } }));
       for (const r of records) { agentActivity.delete(r.id); widget.markFinished(r.id); fleet.onAgentFinished(r.id); }
 
-      const groupKey = `group:${records.map(r => r.id).join(",")}`;
+      const groupKey = `group:${records.map(r => `${r.id}:${r.resultRevision ?? 1}`).join(",")}`;
       scheduleNudge(groupKey, () => {
         // Re-check at send time
-        const unconsumed = records.filter(r => !r.resultConsumed);
+        const unconsumed = records.filter(r => {
+          const live = manager.getRecord(r.id);
+          return (live?.consumedRevision ?? 0) < (r.resultRevision ?? 1) && !(live?.resultConsumed && live.resultRevision === r.resultRevision);
+        });
         if (unconsumed.length === 0) { widget.update(); return; }
 
         const notifications = unconsumed.map(r => formatTaskNotification(r, 300, showCost)).join('\n\n');
@@ -559,6 +569,8 @@ export default function (pi: ExtensionAPI) {
       type: record.type,
       description: record.description,
       result: record.result,
+      resultRevision: record.resultRevision ?? 1,
+      executionEpoch: record.executionEpoch ?? 1,
       error: record.error,
       status: record.status,
       toolUses: record.toolUses,
@@ -589,6 +601,8 @@ export default function (pi: ExtensionAPI) {
     pi.appendEntry("subagents:record", {
       id: record.id, type: record.type, description: record.description,
       status: record.status, result: record.result, error: record.error,
+      resultRevision: record.resultRevision ?? 1, consumedRevision: record.consumedRevision,
+      executionEpoch: record.executionEpoch ?? 1,
       startedAt: record.startedAt, completedAt: record.completedAt,
     });
 
@@ -600,6 +614,9 @@ export default function (pi: ExtensionAPI) {
       widget.update();
       return;
     }
+
+    if (record.autonomousRevision) { sendIndividualNudge(record); return; }
+    pendingBatchCompletions.set(record.id, { ...record, lifetimeUsage: { ...record.lifetimeUsage } });
 
     // If this agent is pending batch finalization (debounce window still open),
     // don't send an individual nudge — finalizeBatch will pick it up retroactively.
@@ -813,15 +830,18 @@ export default function (pi: ExtensionAPI) {
           // itself off `getRecord`, and reports the refusal instead of the
           // "Agent not found" a false from here used to be read as.
           abort: (id) => manager.abort(id),
-          consumeResult: (id) => {
+          consumeResult: (id, resultRevision) => {
             const record = resolveAgentRef(id);
             // Same guard as get_subagent_result: a running agent has no result
             // to consume, and its notification is still the caller's only
             // signal that it finished.
             if (!record || record.parentAgentId) return false;
-            if (record.status === "running" || record.status === "queued") return false;
-            record.resultConsumed = true;
-            cancelNudge(record.id);
+            const revision = resultRevision ?? record.resultRevision ?? 1;
+            if (revision > (record.resultRevision ?? 1)) return false;
+            if (resultRevision === undefined && (record.status === "running" || record.status === "queued")) return false;
+            record.consumedRevision = Math.max(record.consumedRevision ?? 0, revision);
+            if (revision === (record.resultRevision ?? 1)) record.resultConsumed = true;
+            cancelNudge(`${record.id}:${revision}`);
             return true;
           },
         },
@@ -1317,6 +1337,7 @@ export default function (pi: ExtensionAPI) {
   // Uses a debounced timer: each new agent resets the 100ms window so that all
   // parallel tool calls (which may be dispatched across multiple microtasks by the
   // framework) are captured in the same batch.
+  const pendingBatchCompletions = new Map<string, AgentRecord>();
   let currentBatchAgents: { id: string; joinMode: JoinMode }[] = [];
   let batchFinalizeTimer: ReturnType<typeof setTimeout> | undefined;
   let batchCounter = 0;
@@ -1336,9 +1357,11 @@ export default function (pi: ExtensionAPI) {
       // Their onComplete fired but was deferred (agent was in currentBatchAgents),
       // so we feed them into the group now.
       for (const id of ids) {
-        const record = manager.getRecord(id);
+        const record = pendingBatchCompletions.get(id) ?? manager.getRecord(id);
+        pendingBatchCompletions.delete(id);
         if (!record) continue;
         record.groupId = groupId;
+        cancelNudge(`${id}:${record.resultRevision ?? 1}`);
         if (record.completedAt != null && !record.resultConsumed) {
           groupJoin.onAgentComplete(record);
         }
@@ -1347,7 +1370,8 @@ export default function (pi: ExtensionAPI) {
       // No group formed — send individual nudges for any agents that completed
       // during the debounce window and had their notification deferred.
       for (const { id } of batchAgents) {
-        const record = manager.getRecord(id);
+        const record = pendingBatchCompletions.get(id) ?? manager.getRecord(id);
+        pendingBatchCompletions.delete(id);
         if (record?.completedAt != null && !record.resultConsumed) {
           sendIndividualNudge(record);
         }
@@ -1374,6 +1398,7 @@ export default function (pi: ExtensionAPI) {
     opts: { outputTranscript: boolean; maxTurns?: number; hardLimit?: boolean; toolCallId?: string },
   ): Promise<AgentRecord | undefined> {
     const id = existing.id;
+    cancelNudge(`${id}:${existing.resultRevision ?? 1}`);
     const joinMode = resolveJoinMode(defaultJoinMode, true);
     // Assigned unconditionally: the completion notification carries this as
     // `<tool-use-id>`, so a mention-resume (which passes none) has to CLEAR the
@@ -2955,7 +2980,7 @@ Terse command-style prompts produce shallow, generic work.
       statsParts.push(`Duration: ${duration}`);
 
       let output =
-        `Agent: ${record.id}\n` +
+        `Agent: ${record.id}\nResult revision: ${record.resultRevision ?? 1}\n` +
         `Type: ${displayName} | Status: ${record.status}${getStatusNote(record.status)} | ${statsParts.join(" | ")}\n` +
         `Description: ${record.description}\n\n`;
 
@@ -2970,7 +2995,8 @@ Terse command-style prompts produce shallow, generic work.
       // Mark result as consumed — suppresses the completion notification
       if (record.status !== "running" && record.status !== "queued") {
         record.resultConsumed = true;
-        cancelNudge(params.agent_id);
+        record.consumedRevision = record.resultRevision ?? 1;
+        cancelNudge(`${record.id}:${record.resultRevision ?? 1}`);
       }
 
       // Verbose: include full conversation

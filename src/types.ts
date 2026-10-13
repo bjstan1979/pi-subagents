@@ -219,6 +219,11 @@ export interface AgentRecord {
   joinMode?: JoinMode;
   /** Set when result was already consumed via get_subagent_result — suppresses completion notification. */
   resultConsumed?: boolean;
+  /** Monotonic publication revision; consumption is scoped to this value. */
+  resultRevision?: number;
+  consumedRevision?: number;
+  executionEpoch?: number;
+  autonomousRevision?: boolean;
   /** Steering messages queued before the session was ready. */
   pendingSteers?: string[];
   /** Worktree info if the agent is running in an isolated worktree. */
@@ -326,6 +331,7 @@ export interface AgentInvocation {
 
 /** Details attached to custom notification messages for visual rendering. */
 export interface NotificationDetails {
+  resultRevision?: number;
   id: string;
   description: string;
   status: string;

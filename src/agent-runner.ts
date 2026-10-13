@@ -1455,6 +1455,8 @@ export interface RunOptions {
   /** Called on streaming text deltas from the assistant response. */
   onTextDelta?: (delta: string, fullText: string) => void;
   onSessionCreated?: (session: AgentSession) => void;
+  /** Manager capability registration, before extension startup can launch work. */
+  onSessionReady?: (session: AgentSession, effective: Readonly<{ maxTurns?: number; hardLimit: boolean }>) => void;
   /** Called at the end of each agentic turn with the cumulative count. */
   onTurnEnd?: (turnCount: number) => void;
   /**
@@ -2056,6 +2058,11 @@ export async function runAgent(
     options.agentId ? `${baseSessionName}#${options.agentId.slice(0, 8)}` : baseSessionName,
   );
 
+  options.onSessionReady?.(session, Object.freeze({
+    maxTurns: resolveEffectiveMaxTurns(type, options.maxTurns),
+    hardLimit: options.hardLimit ?? agentConfig?.hardLimit ?? false,
+  }));
+
   // Bind extensions so that session_start fires and extensions can initialize
   // (e.g. loading credentials, setting up state). Tool gating already happened
   // at session construction via the `tools:` allowlist above — no separate
@@ -2257,6 +2264,8 @@ export async function resumeAgent(
   options: {
     maxTurns?: number;
     hardLimit?: boolean;
+    /** Invoke the admitted operation without changing custom-message semantics. */
+    execute?: () => Promise<void>;
     onTurnEnd?: (turnCount: number) => void;
     onToolActivity?: (activity: ToolActivity) => void;
     onAssistantUsage?: (usage: LifetimeUsage) => void;
@@ -2379,7 +2388,7 @@ export async function resumeAgent(
   let inStructuredRetry = false;
   try {
     // Already aborted: not prompted, as in `runAgent`.
-    if (options.signal?.aborted !== true) await session.prompt(prompt);
+    if (options.signal?.aborted !== true) await (options.execute ? options.execute() : session.prompt(prompt));
     if (structuredCapture !== undefined && structuredCapture.json === undefined
       && options.signal?.aborted !== true) {
       structuredRetried = true;
