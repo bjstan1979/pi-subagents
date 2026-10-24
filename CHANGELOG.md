@@ -9,6 +9,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Subagent checkpoints: `resume` now reaches agents whose in-memory record is gone.** The `Agent` tool's `resume` used to resolve only live records, so an agent evicted ~10 minutes after finishing (or a parent session reopened with `--continue`/`--resume`) answered `Agent not found` — the model had no way to continue that conversation, and only a human `@handle` mention could. Two layers fix this, without touching the workflow subsystem:
+  - **Tombstone fallback.** A `resume` the manager cannot resolve live now falls through to the tombstone map — the same trusted record the `@handle` mention path reopens. The session file always comes from our own records (the model names the agent, never a path), so the forged-handle security property is unchanged. A tombstone whose session file has vanished is dropped and reported, instead of failing forever.
+  - **Checkpoint index.** Every settled top-level agent with a persisted session appends a `subagents:checkpoint` entry to the *parent session file* (`pi.appendEntry`); `session_start` replays them into an in-memory index. After `--continue`/`--resume`, `resume: "<id>"` reopens that saved conversation — no extra state files, and `/new` still starts clean (fresh handles; the design intent of the tombstone wipe stands). A resumed conversation gets a fresh record and id, reported in the tool result; old handle/alias names come back only when no live agent holds them, so `@handle` can never become ambiguous.
+- **Terminal results and completion notifications now say the agent is resumable**, with the id to `resume` with — a run killed by its turn cap is the main case the model needs to act on. `resume` also accepts a live agent's `@handle` now, not just its id.
+- **`resume` honors `run_in_background: false` even for a cleaned-up agent**: the saved session reopens and the tool waits inline for the resumed run's answer — in print/RPC mode a detached resume's result could never come back, since the main loop settles before the completion notification lands.
+- Tests: `test/checkpoint-resume.test.ts` (CheckpointIndex unit + tombstone/checkpoint/tool wiring, 10 cases).
+
+### Local
+
 - Local opt-in `hard_limit` turn ceilings; defaults remain soft.
 
 ## [0.21.0] - 2026-10-12
