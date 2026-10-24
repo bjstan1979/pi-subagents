@@ -10,8 +10,8 @@
  *   /agents                 — Interactive agent management menu
  */
 
-import { existsSync, mkdirSync, readFileSync, unlinkSync, writeFileSync } from "node:fs";
-import { isAbsolute, join } from "node:path";
+import { existsSync, mkdirSync, readFileSync, realpathSync, unlinkSync, writeFileSync } from "node:fs";
+import { dirname, isAbsolute, join, sep } from "node:path";
 import { defineTool, type ExtensionAPI, type ExtensionCommandContext, type ExtensionContext, getAgentDir, getSettingsListTheme } from "@earendil-works/pi-coding-agent";
 import { Container, isKeyRelease, Key, matchesKey, type ScrollViewScrollbar, type SettingItem, SettingsList, Spacer, Text } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
@@ -40,7 +40,7 @@ import { SubagentScheduler } from "./schedule.js";
 import { resolveStorePath, ScheduleStore } from "./schedule-store.js";
 import { applyAndEmitLoaded, loadSettings, type SubagentsSettings, saveAndEmitChanged, type ToolDescriptionMode } from "./settings.js";
 import { getForegroundOutcomeNote, getStatusNote, partialOutputSuffix } from "./status-note.js";
-import { type AgentConfig, type AgentInvocation, type AgentMentionMode, type AgentRecord, type JoinMode, type NotificationDetails, type SubagentType, type ViewerMarkdownMode, type WidgetMode } from "./types.js";
+import { type AgentConfig, type AgentInvocation, type AgentMentionMode, type AgentRecord, type AgentTombstone, type JoinMode, type NotificationDetails, type SubagentType, type ViewerMarkdownMode, type WidgetMode } from "./types.js";
 import { createMentionProvider, mentionRoster, type TypeInfo } from "./ui/agent-mention.js";
 import {
   type AgentActivity,
@@ -577,6 +577,11 @@ export default function (pi: ExtensionAPI) {
   // Rebuilt per session — /new starts clean, --resume replays this session's
   // own checkpoint entries.
   const checkpointIndex = new CheckpointIndex();
+  // When the current parent session began. An agent that was already running
+  // when the session switched (clearCompleted skips running records) settles
+  // into the NEW session afterwards; its checkpoint must not land there, or a
+  // session that never spawned the agent replays it as its own on restart.
+  let sessionStartedAt = 0;
 
   // Background completion: route through group join or send individual nudge
   const manager = new AgentManager((record) => {
@@ -607,7 +612,7 @@ export default function (pi: ExtensionAPI) {
     // reopened — the entry rides the parent session file, and session_start
     // replays it into the index. Same session coverage the tombstone map has,
     // minus the eviction and /new wipes.
-    if (record.sessionFile) {
+    if (record.sessionFile && (record.startedAt ?? 0) >= sessionStartedAt) {
       const checkpoint: CheckpointEntry = {
         id: record.id,
         handle: record.handle,
@@ -873,12 +878,16 @@ export default function (pi: ExtensionAPI) {
       watchHandoffKey(ctx.ui);
     }
     manager.clearCompleted(true);
+    sessionStartedAt = Date.now();
     // Replay this session's own checkpoint entries: agents settled before the
     // process exited stay resumable by id/handle after `--continue`/`--resume`.
     // A session opened fresh (/new) has none, so it starts clean — matches the
     // tombstone wipe above rather than fighting it.
     try {
-      const priorEntries = ctx.sessionManager?.getEntries?.() ?? [];
+      // The active branch only: getEntries() would also replay checkpoints
+      // recorded on /tree branches the session has since abandoned (the same
+      // distinction context.ts and mention-clone.ts make).
+      const priorEntries = ctx.sessionManager?.getBranch?.() ?? ctx.sessionManager?.getEntries?.() ?? [];
       checkpointIndex.clear();
       for (const checkpoint of CheckpointIndex.fromSessionEntries(priorEntries).list()) {
         checkpointIndex.add(checkpoint);
@@ -1489,46 +1498,67 @@ export default function (pi: ExtensionAPI) {
    * Callers must have already established that the record has a session.
    */
   /**
-   * Resume an agent whose in-memory record is gone, from a record this
-   * extension itself wrote: the manager's tombstone (evicted this session) or
-   * a checkpoint entry replayed from the parent session file (a previous run
-   * of this session). The model names the agent — id, handle or alias — never
-   * a path; the session file always comes from our own records, so a forged
-   * ref just misses. Detached by default, like the @handle mention resume this
-   * mirrors; `run_in_background: false` waits inline instead, which is the
-   * only way a print/RPC caller ever sees the resumed run's result. The
-   * returned text carries the NEW agent id, since a reopened conversation
-   * gets a fresh record. Returns undefined when nothing on disk answers, so
-   * the caller can fall through to its not-found text.
+   * The trusted on-disk record for a resume ref: an in-session tombstone, or
+   * a checkpoint entry replayed from the parent session file. The model names
+   * the agent — id, handle or alias, never a path; the session file always
+   * comes from records this extension itself wrote, so a forged ref just
+   * misses.
+   */
+  function lookupStoredEntry(ref: string):
+    | { kind: "tombstone"; entry: AgentTombstone; label: string }
+    | { kind: "checkpoint"; entry: CheckpointEntry; label: string }
+    | undefined {
+    const mention = manager.resolveMention(ref);
+    if (mention?.kind === "tombstone") {
+      return { kind: "tombstone", entry: mention.entry, label: `@${mention.entry.alias ?? mention.entry.handle}` };
+    }
+    const checkpoint = checkpointIndex.get(ref);
+    if (checkpoint) return { kind: "checkpoint", entry: checkpoint, label: `@${checkpoint.alias ?? checkpoint.handle ?? checkpoint.id}` };
+    return undefined;
+  }
+
+  /**
+   * Reopen a stored conversation. Detached by default, like the @handle
+   * mention resume this mirrors; `run_in_background: false` waits inline
+   * (with the caller's abort signal), which is the only way a print/RPC
+   * caller ever sees the resumed run's result. The returned text carries the
+   * NEW agent id, since a reopened conversation gets a fresh record.
    */
   async function resumeFromStore(
     ctx: ExtensionContext,
     toolCallId: string | undefined,
-    params: { resume: string; prompt: string; run_in_background?: boolean },
-    maxTurns: number | undefined,
-  ): Promise<string | undefined> {
-    type StoreEntry = { sessionFile: string; type: string; handle?: string; alias?: string; description: string };
-    let entry: StoreEntry;
-    let label: string;
-    let tombstoneHandle: string | undefined;
-    const mention = manager.resolveMention(params.resume);
-    if (mention?.kind === "tombstone") {
-      entry = mention.entry;
-      label = `@${mention.entry.alias ?? mention.entry.handle}`;
-      tombstoneHandle = mention.entry.handle;
-    } else {
-      const checkpoint = checkpointIndex.get(params.resume);
-      if (!checkpoint) return undefined;
-      entry = checkpoint;
-      label = `@${checkpoint.alias ?? checkpoint.handle ?? checkpoint.id}`;
-    }
+    stored: NonNullable<ReturnType<typeof lookupStoredEntry>>,
+    params: { prompt: string; max_turns?: number; run_in_background?: boolean },
+    signal: AbortSignal | undefined,
+  ): Promise<string> {
+    const entry = stored.entry;
+    const label = stored.label;
     // A session file that has gone (deleted, `/new` in another window) leaves
     // an entry that can only ever fail — drop it and say so, like the mention
     // path does.
     if (!existsSync(entry.sessionFile)) {
-      if (tombstoneHandle) manager.dropTombstone(tombstoneHandle);
-      else checkpointIndex.remove(params.resume);
+      if (stored.kind === "tombstone") manager.dropTombstone(stored.entry.handle);
+      else checkpointIndex.remove(entry.id);
       return `Could not resume ${label} — its session file is gone.`;
+    }
+    // Checkpoint entries ride the parent session file, which is data someone
+    // else can write (a shared or exported session). Contain what we open:
+    // the saved conversation must be a real .jsonl inside THIS session's own
+    // directory, or the entry does not belong to this session and must not be
+    // opened — SessionManager.open appends to the file it opens.
+    if (stored.kind === "checkpoint") {
+      try {
+        const sessionFile = ctx.sessionManager?.getSessionFile?.();
+        if (!sessionFile) return `Could not resume ${label} — no session file is active, so its checkpoint cannot be verified.`;
+        const sessionDir = realpathSync(dirname(sessionFile));
+        const target = realpathSync(entry.sessionFile);
+        const contained = (target === sessionDir || target.startsWith(sessionDir + sep)) && target.endsWith(".jsonl");
+        if (!contained) {
+          return `Could not resume ${label} — its recorded session file is outside this session's directory, so the checkpoint entry does not belong to this session.`;
+        }
+      } catch {
+        return `Could not resume ${label} — its recorded session file could not be verified.`;
+      }
     }
     // The Agent tool falls back to general-purpose for a type it cannot
     // resolve (#183); a resume must not inherit that. Reopening this
@@ -1538,13 +1568,21 @@ export default function (pi: ExtensionAPI) {
     if (!dispatch.ok || dispatch.fellBackFrom !== undefined) {
       return `Could not resume ${label} — the ${entry.type} agent is no longer available. Re-enable that agent type to continue this conversation.`;
     }
-    // Take the old names back unless a LIVE agent holds them: tombstoned names
-    // are inert (allocation already avoids them), so the tombstone being
-    // resumed always gets its own name back — but a checkpoint from an earlier
-    // run of this session may collide with a fresh spawn, and a duplicated
-    // handle would make @handle ambiguous.
-    const heldLive = (name?: string) => name !== undefined && manager.resolveMention(name)?.kind === "live";
-    const namesFree = !heldLive(entry.handle) && !heldLive(entry.alias);
+    // Not `effectiveMaxTurns`: that was resolved for `subagent_type`, which a
+    // resume ignores. Same precedence as resumeTurnLimit, minus the invocation
+    // budget a stored entry does not carry: the stored type's frontmatter
+    // decides, else the call's, else the default.
+    const maxTurns = normalizeMaxTurns(getAgentConfig(entry.type)?.maxTurns ?? params.max_turns ?? getDefaultMaxTurns());
+    // Take the old names back unless a LIVE agent holds them, or a tombstone
+    // of a DIFFERENT conversation does: tombstoned names are inert, but when
+    // this resumed record is itself evicted its tombstone would overwrite the
+    // other conversation's — and @handle would silently change subject.
+    const heldElsewhere = (name?: string) => {
+      if (name === undefined) return false;
+      if (manager.resolveMention(name)?.kind === "live") return true;
+      return manager.listTombstones().some(t => (t.handle === name || t.alias === name) && t.sessionFile !== entry.sessionFile);
+    };
+    const namesFree = !heldElsewhere(entry.handle) && !heldElsewhere(entry.alias);
     const spawnOptions = {
       description: entry.description || `Resumed ${label}`,
       reclaim: namesFree && entry.handle ? { handle: entry.handle, alias: entry.alias } : undefined,
@@ -1555,12 +1593,17 @@ export default function (pi: ExtensionAPI) {
     // Inline resume: the caller asked to block (run_in_background: false), and
     // in print/RPC mode a detached resume's result could never come back — the
     // main loop settles before the completion notification lands. Wait for the
-    // settled record instead, exactly like a foreground spawn.
+    // settled record instead, exactly like a foreground spawn, and honor the
+    // caller's abort signal: Esc must stop this child too.
     if (params.run_in_background === false) {
-      const { record } = await manager.spawnAndWait(pi, ctx, dispatch.type, params.prompt, spawnOptions);
-      if (record) record.toolCallId = toolCallId;
+      const { record } = await manager.spawnAndWait(pi, ctx, dispatch.type, params.prompt, { ...spawnOptions, signal });
+      record.toolCallId = toolCallId;
       if (record.status === "error") {
-        return `Resumed ${label} inline from its saved session, but the run failed: ${record.error}${partialOutputSuffix(record)}`;
+        return `Resumed ${label} inline from its saved session, but the run failed: ${record.error}${partialOutputSuffix(record)}${resumableNote(record)}`;
+      }
+      if (record.status === "stopped" || record.status === "aborted") {
+        return `Resumed ${label} inline from its saved session, but the run was ${record.status}${getForegroundOutcomeNote(record.status)}.\n\n` +
+          (record.result?.trim() || "No output.") + resumableNote(record);
       }
       return (
         `Resumed ${label} inline from its saved session.\n\n` +
@@ -1583,6 +1626,14 @@ export default function (pi: ExtensionAPI) {
     );
   }
 
+  /**
+   * Launch a detached resume of an existing agent and wire everything a
+   * re-running agent needs: transcript anchoring, activity tracking, join-mode
+   * batching, the widget/fleet refresh, and the `subagents:created` event.
+   * Shared by the Agent tool's `resume` + `run_in_background` branch and the
+   * `@handle message` prompt mention. Callers must have already established
+   * that the record has a session and is not running.
+   */
   async function startBackgroundResume(
     ctx: ExtensionContext,
     existing: AgentRecord,
@@ -2294,27 +2345,51 @@ Terse command-style prompts produce shallow, generic work.
 
       // Resume existing agent
       if (params.resume) {
+        // Accept the id, handle or alias the result texts teach — including
+        // the leading-@ spelling the resumable note suggests.
+        const ref = params.resume.trim().replace(/^@/, "");
         // An id first (the result texts teach ids), then a live handle/alias,
         // then the trusted on-disk records this extension itself keeps: an
         // in-session tombstone, or a checkpoint entry replayed from this
         // session's own history.
-        let existing = manager.getRecord(params.resume);
+        let existing = manager.getRecord(ref);
         if (existing && !isTopLevelAgent(existing)) existing = undefined;
         if (!existing) {
-          const mention = manager.resolveMention(params.resume);
+          const mention = manager.resolveMention(ref);
           if (mention?.kind === "live" && isTopLevelAgent(mention.record)) existing = mention.record;
+        }
+        const stored = existing ? undefined : lookupStoredEntry(ref);
+        if (!existing && stored) {
+          // The saved conversation may already be open in this process: a
+          // first resume's record answers by its NEW id, while the OLD id
+          // keeps resolving to the stored entry here. Route to the holder
+          // instead of opening the same session file a second time — two
+          // writers appending one JSONL would fork the conversation.
+          const holder = manager.listAgents().find(r => isTopLevelAgent(r) && r.sessionFile === stored.entry.sessionFile);
+          if (holder) existing = holder;
         }
         if (!existing) {
           try {
-            const stored = await resumeFromStore(ctx, toolCallId, { resume: params.resume, prompt: params.prompt, run_in_background: runInBackground }, effectiveMaxTurns);
-            if (stored !== undefined) return textResult(stored);
+            if (stored) {
+              return textResult(await resumeFromStore(ctx, toolCallId, stored, params, signal));
+            }
           } catch (err) {
-            return textResult(`Failed to resume "${params.resume}": ${err instanceof Error ? err.message : String(err)}`);
+            return textResult(`Failed to resume "${ref}": ${err instanceof Error ? err.message : String(err)}`);
           }
           return textResult(`Agent not found: "${params.resume}". It may have been cleaned up.`);
         }
         if (!existing.session) {
-          return textResult(`Agent "${params.resume}" has no active session to resume.`);
+          return textResult(`Agent "${ref}" has no active session to resume.`);
+        }
+        // A resume cannot re-enter an agent that is still running or queued —
+        // on EITHER branch. manager.resume's inline path would stomp the live
+        // run's abort controller and double-prompt it, leaving the real run
+        // unreachable from here. Say why where the model can act on it.
+        if (existing.status === "running" || existing.status === "queued") {
+          return textResult(
+            `Agent "${ref}" is still ${existing.status} — it can only be resumed once its current run finishes.\n` +
+            `Use steer_subagent to send it a message mid-run, or get_subagent_result to wait for it.`,
+          );
         }
         // Not `effectiveMaxTurns`: that was resolved for `subagent_type`, which
         // a resume ignores, so it may describe another agent.
@@ -2326,17 +2401,6 @@ Terse command-style prompts produce shallow, generic work.
         // so a resumed agent always blocked the main loop until it finished.
         if (runInBackground) {
           const id = existing.id;
-          // A detached resume hands control back while the record stays
-          // "running", so nothing stops the model from resuming the same agent
-          // again mid-run. manager.resume() refuses that (it would orphan the
-          // live run's abort controller); say why here, where the model can act
-          // on it, instead of letting it read as a generic failure.
-          if (existing.status === "running" || existing.status === "queued") {
-            return textResult(
-              `Agent "${params.resume}" is still ${existing.status} — it can only be resumed once its current run finishes.\n` +
-              `Use steer_subagent to send it a message mid-run, or get_subagent_result to wait for it.`,
-            );
-          }
 
           const record = await startBackgroundResume(ctx, existing, params.prompt, {
             outputTranscript,
@@ -2372,7 +2436,7 @@ Terse command-style prompts produce shallow, generic work.
         fleet.update();
         let record: AgentRecord | undefined;
         try {
-          record = await manager.resume(params.resume, params.prompt, signal, {
+          record = await manager.resume(existing.id, params.prompt, signal, {
             maxTurns: resumeMaxTurns,
             onTurnEnd: resumeCallbacks.onTurnEnd,
             onToolActivity: resumeCallbacks.onToolActivity,
