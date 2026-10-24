@@ -15,6 +15,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Steering from the conversation viewer or the fleet list now emits `subagents:steered`.** Only the `steer_subagent` tool and an `@handle` steer did before, so an extension watching the event missed every steer typed into a viewer. The event now fires from `AgentManager.steer`, which every path except the steer tools goes through.
 - **Resumed agents are bounded by `max_turns` again, and their turn counter moves** (fixes [#368](https://github.com/tintinweb/pi-subagents/issues/368) — thanks [@mratsim](https://github.com/mratsim)). The steer → grace → abort machine ran only over a spawn's first prompt, so a resume — from the `Agent` tool, an `@handle`, a nested agent or a workflow — had no turn limit at all and its widget row stayed at `↻1`. A resumed run now gets a fresh budget counted from the resume prompt, resolved as for a spawn, and can end `steered` or `aborted` like the first run.
 
+### Added (this PR)
+- **`resume` now reaches agents whose in-memory record is gone.** The `Agent` tool's `resume` resolved only live records, so an agent evicted ~10 minutes after finishing — or one settled by a previous process, after `pi --continue`/`--resume` — answered `Agent not found: "...". It may have been cleaned up.` Only a human `@handle` mention could reopen such a conversation; the model had no path back to context it had already paid for. Two layers, with the security shape of the mention path preserved (the session file always comes from the extension's own records — the model names the agent, never a path):
+  - **Tombstone fallback.** A `resume` the manager cannot resolve live falls through to the tombstone map, the same record the mention path reopens. A tombstone whose session file has vanished is dropped and reported instead of failing forever.
+  - **Checkpoint index.** Every settled top-level agent with a persisted session appends a `subagents:checkpoint` custom entry to the parent session file (`pi.appendEntry`); `session_start` replays them into a `CheckpointIndex` (new `src/checkpoint-index.ts`, capped at 100). `--continue`/`--resume` can resume agents settled before the process exited; `/new` still starts clean, matching the tombstone wipe. A resumed conversation gets a fresh record and id (reported in the result); old handle/alias names come back only when no live agent holds them, so `@handle` can never become ambiguous.
+  - **`run_in_background: false` now waits inline on the stored paths too.** In print/RPC mode a detached resume's result could never arrive — the main loop settles before the completion notification lands.
+  - Terminal results and completion notifications now state that the agent is resumable, with the id to `resume` with; a run killed by its turn cap is the main case the model needs to act on. `resume` also accepts a live agent's `@handle`, not just its id.
+- Tests: `test/checkpoint-resume.test.ts` — the index, the tombstone fallback, the checkpoint replay across a `session_start`, the gone-file drop, the inline resume, and the unchanged still-running refusal.
+
 ## [0.22.0] - 2026-10-13
 
 > **⚠️ Possibly breaking — background completion delivery changed ([#388](https://github.com/tintinweb/pi-subagents/pull/388)):**
@@ -34,6 +42,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 - **`session_shutdown` now disposes the widget and group-join manager** (fixes [#256](https://github.com/tintinweb/pi-subagents/issues/256), [#316](https://github.com/tintinweb/pi-subagents/pull/316) — thanks [@joshua-zyy](https://github.com/joshua-zyy)). The handler released the fleet, scheduler and manager but left the `AgentWidget` render interval and the `GroupJoinManager` group timeouts running. Because `session_shutdown` also fires on reload and session replacement, where the Node process survives, those timers outlived the activation and fired into the next session's UI and group state, accumulating across reloads. `session_before_switch` still keeps both, since a vetoed switch continues the session.
+=======
+- **Subagent checkpoints: `resume` now reaches agents whose in-memory record is gone.** The `Agent` tool's `resume` used to resolve only live records, so an agent evicted ~10 minutes after finishing (or a parent session reopened with `--continue`/`--resume`) answered `Agent not found` — the model had no way to continue that conversation, and only a human `@handle` mention could. Two layers fix this, without touching the workflow subsystem:
+  - **Tombstone fallback.** A `resume` the manager cannot resolve live now falls through to the tombstone map — the same trusted record the `@handle` mention path reopens. The session file always comes from our own records (the model names the agent, never a path), so the forged-handle security property is unchanged. A tombstone whose session file has vanished is dropped and reported, instead of failing forever.
+  - **Checkpoint index.** Every settled top-level agent with a persisted session appends a `subagents:checkpoint` entry to the *parent session file* (`pi.appendEntry`); `session_start` replays them into an in-memory index. After `--continue`/`--resume`, `resume: "<id>"` reopens that saved conversation — no extra state files, and `/new` still starts clean (fresh handles; the design intent of the tombstone wipe stands). A resumed conversation gets a fresh record and id, reported in the tool result; old handle/alias names come back only when no live agent holds them, so `@handle` can never become ambiguous.
+- **Terminal results and completion notifications now say the agent is resumable**, with the id to `resume` with — a run killed by its turn cap is the main case the model needs to act on. `resume` also accepts a live agent's `@handle` now, not just its id.
+- **`resume` honors `run_in_background: false` even for a cleaned-up agent**: the saved session reopens and the tool waits inline for the resumed run's answer — in print/RPC mode a detached resume's result could never come back, since the main loop settles before the completion notification lands.
+- Tests: `test/checkpoint-resume.test.ts` (CheckpointIndex unit + tombstone/checkpoint/tool wiring, 10 cases).
+
+### Local
+
+- Local opt-in `hard_limit` turn ceilings; defaults remain soft.
+>>>>>>> e990e0a (feat(resume): checkpoint index + tombstone fallback for the Agent tool's resume)
 
 ## [0.21.0] - 2026-10-12
 
