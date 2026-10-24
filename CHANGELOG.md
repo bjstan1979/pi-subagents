@@ -15,6 +15,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Terminal results and completion notifications now say the agent is resumable**, with the id to `resume` with — a run killed by its turn cap is the main case the model needs to act on. `resume` also accepts a live agent's `@handle` now, not just its id.
 - **`resume` honors `run_in_background: false` even for a cleaned-up agent**: the saved session reopens and the tool waits inline for the resumed run's answer — in print/RPC mode a detached resume's result could never come back, since the main loop settles before the completion notification lands.
 - Tests: `test/checkpoint-resume.test.ts` (CheckpointIndex unit + tombstone/checkpoint/tool wiring, 10 cases).
+- **Review round (external code review, every defect reproduced in the wiring harness before fixing)** — 10 confirmed defects fixed:
+  - **One writer per session file.** A second `resume` by the ORIGINAL id re-resolved the stored entry and opened the same JSONL a second time while the first resumed run was live, in flight, or completed-but-resident. The stored lookup now routes to any live record holding that session file.
+  - `@handle` refs are normalized (the leading `@` never matched); foreground resume by handle addresses the holder by id; the running/queued refusal now guards the inline branch too.
+  - Inline stored resumes honor the caller's abort signal and report stopped/aborted outcomes with the resumable note.
+  - Stored resumes take the turn budget from the STORED type's frontmatter, not the call's `subagent_type`.
+  - Name reclaim skips names held by a tombstone of a DIFFERENT conversation (evicting the resumed record would have overwritten that tombstone).
+  - Checkpoint entries are contained: only real `.jsonl` files inside this session's own directory are opened.
+  - Checkpoints are gated at the session boundary — a pre-`/new` settle writes nothing into the new session.
+  - Replay reads the active branch (`getBranch`); the index resolves name matches to the most recent entry; gone-file cleanup removes by entry id.
+  - Tests grew to 21 (11 review regressions). Known leftover: inline stored resumes do not wire the activity tracker / ctrl+b handoff / transcript streaming (TUI widget degrades to the raw `thinking…` row); detached resumes are unaffected.
 
 ### Local
 
