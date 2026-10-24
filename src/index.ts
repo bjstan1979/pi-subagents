@@ -21,8 +21,9 @@ import { buildNewAgentFile, disableInContent, enableInContent, isEmptyStub, loca
 import { AgentManager, isTopLevelAgent } from "./agent-manager.js";
 import { getAgentConversation, getDefaultMaxTurns, getGraceTurns, getRememberAgents, normalizeMaxTurns, resolveEffectiveMaxTurns, SUBAGENT_TOOL_NAMES, setDefaultMaxTurns, setGraceTurns, setRememberAgents, steerAgent } from "./agent-runner.js";
 import { BUILTIN_TOOL_NAMES, getAgentConfig, getAllTypes, getAvailableTypes, getConfig, getFallbackSubagent, isDefaultsDisabled, NO_FALLBACK, registerAgents, resolveSpawnType, resolveType, setDefaultsDisabled, setFallbackSubagent } from "./agent-types.js";
+import { findCheckpointById } from "./checkpoint-discovery.js";
+import { CHECKPOINT_ENTRY_TYPE, type CheckpointEntry, CheckpointIndex } from "./checkpoint-index.js";
 import { inChildSessionContext } from "./child-context.js";
-import { CheckpointIndex, CHECKPOINT_ENTRY_TYPE, type CheckpointEntry } from "./checkpoint-index.js";
 import { type RpcHandle, registerRpcHandlers } from "./cross-extension-rpc.js";
 import { loadCustomAgents } from "./custom-agents.js";
 import { GroupJoinManager } from "./group-join.js";
@@ -1951,7 +1952,7 @@ Terse command-style prompts produce shallow, generic work.
       ),
       resume: Type.Optional(
         Type.String({
-          description: "Optional agent ID (or @handle) to resume from. Continues from previous context. Works even after the agent was cleaned up, and after this session was closed and reopened — the saved session is reopened from disk. Resumes detached like any other spawn; pass run_in_background: false to block and get the result inline. An agent can only be resumed once its current run has finished — use steer_subagent to reach one mid-run.",
+          description: "Optional agent ID (or @handle) to resume from. Continues from previous context. Works after cleanup or restart; an exact ID also recovers across parent sessions in the same session directory and working directory. Handles remain local to the current parent session. The saved session is reopened from disk. Resumes detached like any other spawn; pass run_in_background: false to block and get the result inline. An agent can only be resumed once its current run has finished — use steer_subagent to reach one mid-run.",
         }),
       ),
       isolated: Type.Optional(
@@ -2312,7 +2313,16 @@ Terse command-style prompts produce shallow, generic work.
           const mention = manager.resolveMention(ref);
           if (mention?.kind === "live" && isTopLevelAgent(mention.record)) existing = mention.record;
         }
-        const stored = existing ? undefined : lookupStoredEntry(ref);
+        let stored = existing ? undefined : lookupStoredEntry(ref);
+        if (!existing && !stored) {
+          // A new parent session has no replayed index for older parents.
+          // Discover only an explicitly named id; never import foreign handles.
+          const sessionFile = ctx.sessionManager?.getSessionFile?.();
+          if (sessionFile) {
+            const checkpoint = await findCheckpointById(dirname(sessionFile), ref, ctx.cwd, signal);
+            if (checkpoint) stored = { kind: "checkpoint", entry: checkpoint, label: `@${checkpoint.alias ?? checkpoint.handle ?? checkpoint.id}` };
+          }
+        }
         if (!existing && stored) {
           // The saved conversation may already be open in this process: a
           // first resume's record answers by its NEW id, while the OLD id

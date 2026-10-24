@@ -21,7 +21,7 @@ vi.mock("../src/agent-runner.js", async () => {
 });
 
 import { resumeAgent, runAgent } from "../src/agent-runner.js";
-import { CheckpointIndex, CHECKPOINT_ENTRY_TYPE, MAX_CHECKPOINTS } from "../src/checkpoint-index.js";
+import { CHECKPOINT_ENTRY_TYPE, CheckpointIndex, MAX_CHECKPOINTS } from "../src/checkpoint-index.js";
 import subagentsExtension from "../src/index.js";
 import { ctx, flush, type Hermetic, hermeticDir, makePi, textOf } from "./helpers/boot-extension.js";
 
@@ -254,7 +254,7 @@ describe("Agent tool resume — evicted and reopened sessions", () => {
     finishedRun();
     const id = await spawnBackground(tools);
     await flush();
-    const manager = await evict(id);
+    await evict(id);
     const { unlinkSync } = await import("node:fs");
     unlinkSync(sessionPath());
     vi.mocked(runAgent).mockClear();

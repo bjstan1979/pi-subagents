@@ -26,6 +26,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - Replay reads the active branch (`getBranch`); the index resolves name matches to the most recent entry; gone-file cleanup removes by entry id.
   - Tests grew to 21 (11 review regressions). Known leftover: inline stored resumes do not wire the activity tracker / ctrl+b handoff / transcript streaming (TUI widget degrades to the raw `thinking…` row); detached resumes are unaffected.
 
+### Fixed
+
+- **Exact-ID resume now works across parent sessions in the same project/session store.** A fresh parent can discover persisted checkpoints on other parent sessions' active branches instead of reporting `Agent not found`. Handles and aliases remain parent-session-local; discovery rejects other working directories, missing transcripts, and paths escaping the session store.
+
 ### Local
 
 - Local opt-in `hard_limit` turn ceilings; defaults remain soft.
