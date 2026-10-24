@@ -58,15 +58,21 @@ export class CheckpointIndex {
     this.entries.delete(id);
   }
 
-  /** Exact agent id first, then handle/alias case-insensitively. */
+  /** Exact agent id first, then handle/alias case-insensitively. Among name
+   *  matches the MOST RECENT entry wins, regardless of insertion order — a
+   *  replayed index is inserted newest-first while a live session adds
+   *  oldest-first, and the two must resolve the same way. */
   get(ref: string): CheckpointEntry | undefined {
     const exact = this.entries.get(ref);
     if (exact) return exact;
     const wanted = ref.toLowerCase();
+    let best: CheckpointEntry | undefined;
     for (const entry of this.entries.values()) {
-      if (entry.handle?.toLowerCase() === wanted || entry.alias?.toLowerCase() === wanted) return entry;
+      if (entry.handle?.toLowerCase() === wanted || entry.alias?.toLowerCase() === wanted) {
+        if (!best || entry.completedAt > best.completedAt) best = entry;
+      }
     }
-    return undefined;
+    return best;
   }
 
   /** Newest first — the order a listing would present. */
