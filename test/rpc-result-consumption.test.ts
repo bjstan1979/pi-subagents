@@ -179,6 +179,23 @@ describe("subagents:rpc:consume", () => {
     expect(reply).toHaveBeenCalledWith({ success: false, error: "Agent not found or still running" });
   });
 
+  it("does not let an old revision acknowledgment suppress a newer result", async () => {
+    vi.mocked(runAgent).mockResolvedValue({ responseText: "REVISION_ONE" } as any);
+    const { bus } = await boot();
+    const id = await spawnOverRpc(bus, "req-revisions");
+    const manager = (globalThis as any)[Symbol.for("pi-subagents:manager")];
+    await vi.waitFor(() => expect(manager.getRecord(id).status).toBe("completed"));
+    const record = manager.getRecord(id);
+    record.resultRevision = 2;
+    record.resultConsumed = false;
+    bus.emit("subagents:rpc:consume", { requestId: "req-old", agentId: id, resultRevision: 1 });
+    expect(record.consumedRevision).toBe(1);
+    expect(record.resultConsumed).toBe(false);
+    bus.emit("subagents:rpc:consume", { requestId: "req-current", agentId: id, resultRevision: 2 });
+    expect(record.consumedRevision).toBe(2);
+    expect(record.resultConsumed).toBe(true);
+  });
+
   it("reports an unknown agent rather than silently succeeding", async () => {
     const { bus } = await boot();
     const reply = vi.fn();

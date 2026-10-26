@@ -30,6 +30,7 @@ import { detectEnv } from "./env.js";
 import { buildMemoryBlock, buildReadOnlyMemoryBlock } from "./memory.js";
 import { createNestedSubagentTools, getMaxSubagentDepth, type NestedAgentManager } from "./nested-tools.js";
 import { buildAgentPrompt, type PromptExtras } from "./prompts.js";
+import { promptWithResumeFallback, type ResumeModelOptions } from "./resume-model.js";
 import { preloadSkills } from "./skill-loader.js";
 import {
   createStructuredCapture,
@@ -1455,6 +1456,7 @@ export interface RunOptions {
   /** Called on streaming text deltas from the assistant response. */
   onTextDelta?: (delta: string, fullText: string) => void;
   onSessionCreated?: (session: AgentSession) => void;
+  onModelChange?: ResumeModelOptions["onModelChange"];
   /** Manager capability registration, before extension startup can launch work. */
   onSessionReady?: (session: AgentSession, effective: Readonly<{ maxTurns?: number; hardLimit: boolean }>) => void;
   /** Called at the end of each agentic turn with the cumulative count. */
@@ -2209,7 +2211,18 @@ export async function runAgent(
     // A signal that fired before this point never calls the listener above, and
     // pi's `session.abort()` is a no-op until a run is active — so a child whose
     // parent is already gone is not prompted at all.
-    if (options.signal?.aborted !== true) await session.prompt(effectivePrompt);
+    if (options.signal?.aborted !== true) {
+      if (options.resumeSessionFile) {
+        await promptWithResumeFallback(session, () => session.prompt(effectivePrompt), {
+          fallbackModel: ctx.model,
+          model: options.model,
+          signal: options.signal,
+          onModelChange: options.onModelChange,
+        }, () => !aborted);
+      } else {
+        await session.prompt(effectivePrompt);
+      }
+    }
 
     // One more prompt when a schema was asked for and nothing usable came back
     // — the model answered in prose, or only ever called the tool invalidly.
@@ -2217,7 +2230,7 @@ export async function runAgent(
     // the abort forwarding are still live: torn down first, a retry would be
     // unkillable.
     if (structuredCapture !== undefined && structuredCapture.json === undefined
-      && options.signal?.aborted !== true) {
+      && !finalTurnError(session, startLen) && options.signal?.aborted !== true) {
       structuredRetried = true;
       inStructuredRetry = true;
       if (aborted) {
@@ -2261,7 +2274,7 @@ export async function runAgent(
 export async function resumeAgent(
   session: AgentSession,
   prompt: string,
-  options: {
+  options: ResumeModelOptions & {
     maxTurns?: number;
     hardLimit?: boolean;
     /** Invoke the admitted operation without changing custom-message semantics. */
@@ -2388,9 +2401,11 @@ export async function resumeAgent(
   let inStructuredRetry = false;
   try {
     // Already aborted: not prompted, as in `runAgent`.
-    if (options.signal?.aborted !== true) await (options.execute ? options.execute() : session.prompt(prompt));
+    if (options.signal?.aborted !== true) {
+      await promptWithResumeFallback(session, () => options.execute ? options.execute() : session.prompt(prompt), options, () => !aborted);
+    }
     if (structuredCapture !== undefined && structuredCapture.json === undefined
-      && options.signal?.aborted !== true) {
+      && !finalTurnError(session, startLen) && options.signal?.aborted !== true) {
       structuredRetried = true;
       inStructuredRetry = true;
       if (aborted) {

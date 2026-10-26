@@ -28,6 +28,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Resume can switch models and recover from hard quota exhaustion.** `model` now applies to live and stored resumes. Explicit quota failures fall back once to the current parent's provider/model, preserving the child conversation, cancellation and turn budget. Transient throttling and unrelated provider errors do not reroute; global model defaults are unchanged.
+
 - **Exact-ID resume now works across parent sessions in the same project/session store.** A fresh parent can discover persisted checkpoints on other parent sessions' active branches instead of reporting `Agent not found`. Handles and aliases remain parent-session-local; discovery rejects other working directories, missing transcripts, and paths escaping the session store.
 
 ### Local

@@ -447,7 +447,7 @@ Launch a sub-agent.
 | `description` | string | yes | Short 3-5 word summary (shown in UI) |
 | `name` | string | no | Memorable name for this agent (`auth-audit`), addressable as `@name` and accepted by `steer_subagent`/`get_subagent_result`. Additive — the type-derived handle is still assigned |
 | `subagent_type` | string | yes | Agent type (built-in or custom) |
-| `model` | string | no | Model — `provider/modelId` or fuzzy name (`"haiku"`, `"sonnet"`). Resolved tolerantly (`.`/`-` and a trailing date stamp interchangeable) with provider fallback |
+| `model` | string | no | Model — `provider/modelId` or fuzzy name (`"haiku"`, `"sonnet"`). Also switches an existing/resumed child; does not change global defaults. Resolved tolerantly (`.`/`-` and a trailing date stamp interchangeable) with provider fallback |
 | `thinking` | string | no | Thinking level: off, minimal, low, medium, high, xhigh, max (availability depends on pi version and model) |
 | `max_turns` | number | no | Max agentic turns. Omit for unlimited (default) |
 | `hard_limit` | boolean | no | Veto exploration tools at the ceiling; default `false`. Forwarded through spawn, resume, nested delegation and scheduling |
@@ -456,6 +456,8 @@ Launch a sub-agent.
 | `isolated` | boolean | no | No extension/MCP tools |
 | `isolation` | `"off"` \| `"worktree"` | no | `worktree` runs in an isolated git worktree; `off` (the default) does not. Absent from the schema entirely when `worktreeIsolation: false` |
 | `inherit_context` | boolean | no | Fork parent conversation into agent |
+
+**Resume model recovery:** A live or stored resume that encounters an explicit account/model quota-exhaustion error automatically switches once to the current parent agent's provider/model. A saved terminal quota error permits switching before the request. Ordinary 429 throttling, timeouts, context limits and authentication failures do not trigger fallback. Cancellation and the current turn budget still apply. The switch is recorded in the child session and announced; only unfinished work is continued, without replaying the original prompt. A second failure is reported, not rerouted again. Pass `model` explicitly to select a different model on resume; the parent and global defaults remain unchanged.
 
 ### `SubagentWorkflow`
 
@@ -498,7 +500,7 @@ Concurrency is capped at `max(1, min(16, cpus - 2))` — the run's own limit, in
 
 ### `get_subagent_result`
 
-Check status and retrieve results from a background agent.
+Check status and retrieve results from a background agent. If only a current-session checkpoint or tombstone remains, the tool explains how to use `Agent({ resume: "<exact-id>", prompt: "..." })`. It does not reopen the conversation automatically: resume starts another run, not a read-only result lookup, and still validates the saved session path.
 
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|
@@ -622,6 +624,8 @@ When background agents complete, they notify the main agent. As in Claude Code, 
 | `smart` (default) | 2+ background agents spawned in the same turn are auto-grouped into a single consolidated notification. Solo agents notify individually. |
 | `async` | Each agent sends its own notification on completion (original behavior). Best when results need incremental processing. |
 | `group` | Force grouping even when spawning a single agent. Useful when you know more agents will follow. |
+
+**Result revisions:** Notifications across individual and grouped delivery are not globally ordered. Track the highest `result-revision` per agent and ignore older revisions rather than overwriting newer conclusions. `get_subagent_result` reports the current result revision; RPC consumers should acknowledge the revision they actually read using `resultRevision` so an old acknowledgment cannot consume a newer result.
 
 **Timeout behavior:** When agents are grouped, a 30-second timeout starts after the first agent completes. If not all agents finish in time, a partial notification is sent with completed results and remaining agents continue with a shorter 15-second re-batch window for stragglers.
 

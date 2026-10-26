@@ -163,6 +163,42 @@ describe("Agent tool resume — evicted and reopened sessions", () => {
   beforeEach(() => vi.useFakeTimers({ toFake: ["setInterval", "Date"] }));
   afterEach(() => vi.useRealTimers());
 
+  it("explains tombstone recovery without starting another run", async () => {
+    const { tools } = boot();
+    finishedRun();
+    const id = await spawnBackground(tools);
+    await flush();
+    await evict(id);
+    vi.mocked(runAgent).mockClear();
+    const result = await tools.get("get_subagent_result").execute(
+      "tc-read", { agent_id: id }, undefined, undefined, ctx(),
+    );
+    expect(textOf(result)).toContain("stored tombstone");
+    expect(textOf(result)).toContain(`resume: ${JSON.stringify(id)}`);
+    expect(textOf(result)).toContain("not a read-only result lookup");
+    expect(runAgent).not.toHaveBeenCalled();
+  });
+
+  it("explains replayed checkpoint recovery without opening its session", async () => {
+    const { tools, lifecycle } = boot();
+    const past = {
+      id: "past-agent-1", handle: "explore", type: "Explore", description: "saved",
+      sessionFile: sessionPath(), status: "completed", completedAt: 1,
+    };
+    const sctx = ctx({ sessionManager: {
+      getSessionId: vi.fn(() => "s1"), getSessionFile: vi.fn(() => sessionPath()),
+      getBranch: vi.fn(() => [{ type: "custom", customType: CHECKPOINT_ENTRY_TYPE, data: past }]),
+    } });
+    await lifecycle.get("session_start")({ type: "session_start" }, sctx);
+    const result = await tools.get("get_subagent_result").execute(
+      "tc-read", { agent_id: "explore" }, undefined, undefined, sctx,
+    );
+    expect(textOf(result)).toContain("stored checkpoint");
+    expect(textOf(result)).toContain('resume: "past-agent-1"');
+    expect(runAgent).not.toHaveBeenCalled();
+    expect(resumeAgent).not.toHaveBeenCalled();
+  });
+
   it("resumes an evicted agent from its tombstone through the tool", async () => {
     const { pi, tools } = boot();
     finishedRun();

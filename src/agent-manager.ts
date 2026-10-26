@@ -305,6 +305,9 @@ interface SpawnOptions {
 }
 
 interface ResumeOptions {
+  model?: Model<any>;
+  fallbackModel?: Model<any>;
+  onModelChange?: (model: Model<any>, reason: "explicit" | "quota") => void;
   /**
    * Run the resumed turn detached in the background: return immediately with
    * the record still "running" (or "queued" at the concurrency limit) and
@@ -918,6 +921,11 @@ export class AgentManager {
       thinkingLevel: options.thinkingLevel,
       structuredOutput: options.structuredOutput,
       resumeSessionFile: options.resumeSessionFile,
+      onModelChange: (model, reason) => {
+        record.invocation ??= {};
+        Object.assign(record.invocation, describeModel(model));
+        ctx.ui.notify(`Subagent ${record.handle ?? id} switched to ${model.provider}/${model.id} (${reason})`, "warning");
+      },
       nested: options.parentAgentId !== undefined,
       workflow: options.workflowId !== undefined,
       // Worktree wins for the working dir (the agent must run in the copy —
@@ -1395,6 +1403,13 @@ export class AgentManager {
 
     try {
       const promise = resumeAgent(record.session, prompt, {
+        model: options?.model,
+        fallbackModel: options?.fallbackModel,
+        onModelChange: (model, reason) => {
+          record.invocation ??= {};
+          Object.assign(record.invocation, describeModel(model));
+          options?.onModelChange?.(model, reason);
+        },
         maxTurns: options?.maxTurns,
         hardLimit: options?.hardLimit,
         onTurnEnd: (turn) => {
@@ -1524,6 +1539,13 @@ export class AgentManager {
     };
 
     const promise = resumeAgent(record.session, prompt, {
+      model: options.model,
+      fallbackModel: options.fallbackModel,
+      onModelChange: (model, reason) => {
+        record.invocation ??= {};
+        Object.assign(record.invocation, describeModel(model));
+        options.onModelChange?.(model, reason);
+      },
       maxTurns: options?.maxTurns,
       hardLimit: options?.hardLimit,
       onTurnEnd: (turn) => {

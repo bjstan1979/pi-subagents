@@ -12,6 +12,7 @@
 
 import { existsSync, mkdirSync, readFileSync, realpathSync, unlinkSync, writeFileSync } from "node:fs";
 import { dirname, isAbsolute, join, sep } from "node:path";
+import type { Model } from "@earendil-works/pi-ai";
 import { defineTool, type ExtensionAPI, type ExtensionCommandContext, type ExtensionContext, getAgentDir, getSettingsListTheme } from "@earendil-works/pi-coding-agent";
 import { Container, isKeyRelease, Key, matchesKey, type ScrollViewScrollbar, type SettingItem, SettingsList, Spacer, Text } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
@@ -1488,7 +1489,7 @@ export default function (pi: ExtensionAPI) {
     ctx: ExtensionContext,
     toolCallId: string | undefined,
     stored: NonNullable<ReturnType<typeof lookupStoredEntry>>,
-    params: { prompt: string; max_turns?: number; run_in_background?: boolean },
+    params: { prompt: string; max_turns?: number; run_in_background?: boolean; model?: string },
     signal: AbortSignal | undefined,
     hardLimit: boolean | undefined,
   ): Promise<string> {
@@ -1548,6 +1549,11 @@ export default function (pi: ExtensionAPI) {
       description: entry.description || `Resumed ${label}`,
       reclaim: namesFree && entry.handle ? { handle: entry.handle, alias: entry.alias } : undefined,
       resumeSessionFile: entry.sessionFile,
+      model: params.model ? (() => {
+        const selected = resolveModel(params.model, ctx.modelRegistry);
+        if (typeof selected === "string") throw new Error(selected);
+        return selected;
+      })() : undefined,
       maxTurns,
       hardLimit,
     };
@@ -1592,7 +1598,7 @@ export default function (pi: ExtensionAPI) {
     ctx: ExtensionContext,
     existing: AgentRecord,
     prompt: string,
-    opts: { outputTranscript: boolean; maxTurns?: number; hardLimit?: boolean; toolCallId?: string },
+    opts: { outputTranscript: boolean; maxTurns?: number; hardLimit?: boolean; toolCallId?: string; model?: Model<any> },
   ): Promise<AgentRecord | undefined> {
     const id = existing.id;
     cancelNudge(`${id}:${existing.resultRevision ?? 1}`);
@@ -1626,6 +1632,9 @@ export default function (pi: ExtensionAPI) {
     // run_in_background in that same turn keep going.
     const record = await manager.resume(id, prompt, undefined, {
       isBackground: true,
+      model: opts.model,
+      fallbackModel: ctx.model,
+      onModelChange: (model, reason) => ctx.ui.notify(`Subagent ${id} switched to ${model.provider}/${model.id} (${reason})`, "warning"),
       maxTurns: opts.maxTurns,
       hardLimit: opts.hardLimit,
       onTurnEnd: bgCallbacks.onTurnEnd,
@@ -2230,10 +2239,9 @@ Terse command-style prompts produce shallow, generic work.
        * `detailBase` for a record that exists, which outranks it: the base is a
        * snapshot of what this call REQUESTED, and pi may have resolved a
        * different model or clamped the thinking level (agent-manager writes the
-       * effective values back when the session reports them). Resume goes
-       * further and ignores the model/thinking parameters outright — it runs on
-       * the session it is reopening — so rendering the base there advertises
-       * settings the run never used.
+       * effective values back when the session reports them). Resume can
+       * switch models explicitly or after quota exhaustion, so rendering the
+       * requested base there advertises settings the run may never have used.
        *
        * The mode label is rebuilt rather than carried over: it hangs off the
        * agent TYPE, not the invocation, so tags taken straight from
@@ -2300,6 +2308,8 @@ Terse command-style prompts produce shallow, generic work.
 
       // Resume existing agent
       if (params.resume) {
+        const resumeModel = params.model ? resolveModel(params.model, ctx.modelRegistry) : undefined;
+        if (typeof resumeModel === "string") return textResult(resumeModel);
         // Accept the id, handle or alias the result texts teach — including
         // the leading-@ spelling the resumable note suggests.
         const ref = params.resume.trim().replace(/^@/, "");
@@ -2365,6 +2375,7 @@ Terse command-style prompts produce shallow, generic work.
             maxTurns: effectiveMaxTurns,
             hardLimit,
             toolCallId,
+            model: resumeModel,
           });
           if (!record) {
             return textResult(`Failed to resume agent "${params.resume}".`);
@@ -2384,6 +2395,9 @@ Terse command-style prompts produce shallow, generic work.
         }
 
         const record = await manager.resume(existing.id, params.prompt, signal, {
+          model: resumeModel,
+          fallbackModel: ctx.model,
+          onModelChange: (model, reason) => ctx.ui.notify(`Subagent ${existing.id} switched to ${model.provider}/${model.id} (${reason})`, "warning"),
           maxTurns: effectiveMaxTurns,
           hardLimit,
         });
@@ -3182,7 +3196,15 @@ Terse command-style prompts produce shallow, generic work.
     execute: async (_toolCallId, params, signal, _onUpdate, _ctx) => {
       const record = resolveAgentRef(params.agent_id);
       if (!record || !isTopLevelAgent(record)) {
-        return textResult(`Agent not found: "${params.agent_id}". It may have been cleaned up.`);
+        const stored = !record ? lookupStoredEntry(params.agent_id) : undefined;
+        if (stored) {
+          return textResult(
+            `Agent ${JSON.stringify(stored.entry.id)} has a stored ${stored.kind}, but no live result record. ` +
+            `To continue its conversation, call Agent with resume: ${JSON.stringify(stored.entry.id)} and a prompt. ` +
+            "Resume starts another run; it is not a read-only result lookup. The saved session will be validated before reopening.",
+          );
+        }
+        return textResult(`Agent not found: "${params.agent_id}". No live result or stored checkpoint is available in this session. Use the exact ID returned by Agent; do not invent an ID.`);
       }
 
       // Wait for completion if requested. Cancellation stops only this tool

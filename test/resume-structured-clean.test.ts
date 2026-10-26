@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { AgentManager } from "../src/agent-manager.js";
 import { resumeAgent, sessionStructuredCaptures } from "../src/agent-runner.js";
 import { STRUCTURED_OUTPUT_TOOL_NAME } from "../src/structured-output.js";
@@ -8,6 +8,20 @@ describe("Resume Structured Clean State & Structured Preservation", () => {
     const manager = new AgentManager();
     return manager;
   }
+
+  it("does not issue a structured-output retry after a terminal provider error", async () => {
+    const session: any = {
+      agent: {}, messages: [], subscribe: () => () => {},
+      getAllTools: () => [{ name: STRUCTURED_OUTPUT_TOOL_NAME }],
+      prompt: vi.fn(async () => {
+        session.messages.push({ role: "assistant", stopReason: "error", errorMessage: "insufficient_quota", content: [] });
+      }),
+    };
+    sessionStructuredCaptures.set(session, { called: false });
+    const result = await resumeAgent(session, "continue");
+    expect(result.failure).toBe("insufficient_quota");
+    expect(session.prompt).toHaveBeenCalledTimes(1);
+  });
 
   it("clears stale structuredJson and structuredRetried on resume start and settlement", async () => {
     const manager = createStubManager();
