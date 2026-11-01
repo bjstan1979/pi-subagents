@@ -16,7 +16,7 @@ For the channel list, the reply envelope, the per-channel snippets and the event
 
 | Field | Type | Notes |
 |---|---|---|
-| `description` | string | What the agent is doing. Shown in the widget, FleetView and the completion notification |
+| `description` | string or null (optional) | What the agent is doing. Omitted/undefined/null uses the agent type; explicit strings, including empty strings, are preserved. Shown in the widget, FleetView and completion notification |
 | `name` | string | A memorable second handle (`@auth-audit`). Slugged, never validated — anything unusable degrades rather than failing the spawn |
 | `model` | `Model` **or** `"provider/modelId"` | Strings are resolved at the RPC boundary against `ctx.modelRegistry`. `null` means inherit, not override. Resolution is fuzzy — see [Model Scope](../README.md#model-scope) |
 | `maxTurns` | number | Turn ceiling for the run |
@@ -49,7 +49,7 @@ For the channel list, the reply envelope, the per-channel snippets and the event
 
 Four things that are not obvious from the tables:
 
-- **Nothing is required at runtime.** `description` is non-optional in TypeScript and never validated. A spawn with no `options` at all is legal and is what `test/cross-extension-rpc.test.ts:81-94` pins.
+- **The options object and description are optional.** A spawn with no `options` at all is legal. The manager normalizes omitted/undefined/null `description` to the agent type before persistence, notification formatting and worktree cleanup; explicit empty/whitespace strings remain unchanged. This prevents a missing display label from silently dropping a completion nudge. Other non-string JSON description values are not supported.
 - **`bypassQueue` is not stripped.** Its own doc comment scopes it to the scheduler and the `/agents` generator, but a bus caller can set it and skip the `maxConcurrent` check.
 - **`structuredOutput` is documented "set only by the workflow host"** (`src/agent-manager.ts:231-234`) and is also not stripped.
 - **`signal` and the `on*` callbacks are function values.** They work only because the bus is in-process. A caller that genuinely serializes its payload cannot use them, and they arrive as `undefined` rather than failing.

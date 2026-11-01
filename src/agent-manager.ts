@@ -167,7 +167,8 @@ interface SpawnArgs {
 }
 
 interface SpawnOptions {
-  description: string;
+  /** Display label; omitted/null RPC values use the agent type. Explicit strings are preserved. */
+  description?: string | null;
   /**
    * Optional memorable name for this instance, becoming a second handle
    * (`@auth-audit`) alongside the type-derived one. Slugged, not validated —
@@ -637,7 +638,7 @@ export class AgentManager {
         // A reclaimed handle is used as-is: it belongs to the conversation this
         // spawn is reopening, and re-deriving it would lose the numbering.
         : options.reclaim?.handle ?? assignHandle(handleBase(type), this.takenHandles()),
-      description: options.description,
+      description: options.description ?? type,
       // Reclaimed here, or filled in below from `name` — in which case it must
       // see the handle this record just took, since both come out of the same
       // namespace.
@@ -893,7 +894,7 @@ export class AgentManager {
       // definition unchanged) worktree instead.
       if (record.status !== "running") {
         this.chargePool(record.chargedPool, -1);
-        record.worktreeResult = await cleanupWorktree(pi, baseCwd, wt, options.description);
+        record.worktreeResult = await cleanupWorktree(pi, baseCwd, wt, record.description);
         this.drainQueue();
         return;
       }
@@ -1049,7 +1050,7 @@ export class AgentManager {
               await options.onBeforeWorktreeCleanup(worktree.path);
             } catch { /* ignore — never block cleanup */ }
           }
-          const wtResult = await cleanupWorktree(pi, baseCwd, worktree, options.description);
+          const wtResult = await cleanupWorktree(pi, baseCwd, worktree, record.description);
           record.worktreeResult = wtResult;
           if (wtResult.hasChanges && wtResult.branch) {
             // With a caller-supplied cwd the branch lives in THAT repo, not the
@@ -1092,7 +1093,7 @@ export class AgentManager {
           const worktree = record.worktree;
           const cleanup = async () => {
           try {
-            const wtResult = await cleanupWorktree(pi, baseCwd, worktree, options.description);
+            const wtResult = await cleanupWorktree(pi, baseCwd, worktree, record.description);
             record.worktreeResult = wtResult;
           } catch { /* ignore cleanup errors */ }
           };
