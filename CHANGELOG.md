@@ -28,6 +28,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Evicted-agent wiring test matches existing tombstone recovery guidance.** It still rejects steering and verifies result lookup starts or resumes no run; runtime behavior is unchanged.
+
 - **RPC spawns without a description deliver completion notifications.** Omitted or null descriptions now use the agent type consistently for records, notifications and worktree cleanup. Explicit description strings are unchanged.
 
 - **Resume can switch models and recover from hard quota exhaustion.** `model` now applies to live and stored resumes. Explicit quota failures fall back once to the current parent's provider/model, preserving the child conversation, cancellation and turn budget. Transient throttling and unrelated provider errors do not reroute; global model defaults are unchanged.

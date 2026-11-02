@@ -1237,14 +1237,16 @@ describe("resuming an evicted agent by name", () => {
     expect(manager.getRecord(resumedId).description).toBe("find flaky tests");
   });
 
-  it("does not let the tools steer or read an agent that is gone", async () => {
-    // A mention can resurrect it, but there is no live record to interrupt and
-    // no result to return — so the tools must say so rather than resolve to a
-    // tombstone and act on stale data.
+  it("refuses steering an evicted agent and explains tombstone recovery without starting a run", async () => {
+    // There is no live record to steer or read. Result lookup explains how to
+    // resume the stored tombstone, but must not start or resume a run itself.
     const { tools } = boot();
     finishedRun(fakeSession());
-    await evict(await spawnBackground(tools));
+    const id = await spawnBackground(tools);
+    await evict(id);
     await flush();
+    vi.mocked(runAgent).mockClear();
+    vi.mocked(resumeAgent).mockClear();
 
     const steered = await tools.get("steer_subagent").execute(
       "tc", { agent_id: "explore", message: "hi" }, undefined, undefined, ctx(),
@@ -1254,7 +1256,12 @@ describe("resuming an evicted agent by name", () => {
     );
 
     expect(textOf(steered)).toContain("Agent not found");
-    expect(textOf(read)).toContain("Agent not found");
+    expect(textOf(read)).toContain("stored tombstone");
+    expect(textOf(read)).toContain("no live result record");
+    expect(textOf(read)).toContain(`resume: ${JSON.stringify(id)}`);
+    expect(textOf(read)).toContain("not a read-only result lookup");
+    expect(runAgent).not.toHaveBeenCalled();
+    expect(resumeAgent).not.toHaveBeenCalled();
   });
 
   it("reports a session that is gone, rather than starting something else", async () => {
