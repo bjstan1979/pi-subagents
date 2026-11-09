@@ -15,7 +15,7 @@
  */
 
 import { randomUUID } from "node:crypto";
-import { statSync } from "node:fs";
+import { realpathSync, statSync } from "node:fs";
 import { isAbsolute } from "node:path";
 import type { Model } from "@earendil-works/pi-ai";
 import type { AgentSession, ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
@@ -489,6 +489,16 @@ export class AgentManager {
     return completion;
   }
   private agents = new Map<string, AgentRecord>();
+  // Trusted stored-session paths only. Hold through queueing and startup until
+  // the run settles, so SessionManager.open never has two concurrent writers.
+  private reopeningSessions = new Map<string, string>();
+  private reopeningById = new Map<string, string>();
+
+  private releaseReopening(id: string): void {
+    const path = this.reopeningById.get(id);
+    if (path !== undefined && this.reopeningSessions.get(path) === id) this.reopeningSessions.delete(path);
+    this.reopeningById.delete(id);
+  }
   private cleanupInterval: ReturnType<typeof setInterval>;
   private onComplete?: OnAgentComplete;
   private onStart?: OnAgentStart;
@@ -626,6 +636,18 @@ export class AgentManager {
     assertValidSpawnCwd(options.cwd);
 
     const id = randomUUID().slice(0, 17);
+    // Canonicalize before claiming: separate checkpoint spellings (including
+    // symlinks) must not open the same file twice. A missing path fails closed.
+    const reopening = options.resumeSessionFile ? realpathSync(options.resumeSessionFile) : undefined;
+    if (reopening) {
+      const held = [...this.agents.values()].some(record => {
+        if (!record.session || !record.sessionFile) return false;
+        try { return realpathSync(record.sessionFile) === reopening; } catch { return false; }
+      });
+      if (held || this.reopeningSessions.has(reopening)) {
+        throw new Error("This saved session is already being reopened or is running.");
+      }
+    }
     const abortController = new AbortController();
     const record: AgentRecord = {
       id,
@@ -669,6 +691,10 @@ export class AgentManager {
       maxSubagentDepth: options.maxSubagentDepth,
       rootSessionId: options.rootSessionId,
     };
+    if (reopening) {
+      this.reopeningSessions.set(reopening, id);
+      this.reopeningById.set(id, reopening);
+    }
     this.agents.set(id, record);
     this.recordGenerations.set(record, this.parentGeneration);
     // After the insert, so `takenHandles()` already counts this record's own
@@ -688,7 +714,10 @@ export class AgentManager {
       record.status = "queued";
       // A queued record never reaches startAgent's signal wiring, so arm the
       // parent abort here or Esc could not release the position.
-      if (!this.armQueuedAbort(id, options.signal)) return id;
+      if (!this.armQueuedAbort(id, options.signal)) {
+        this.releaseReopening(id);
+        return id;
+      }
       let release!: () => void;
       record.startGate = new Promise<void>(resolve => { release = resolve; });
       this.queue.push({
@@ -697,7 +726,12 @@ export class AgentManager {
         start: () => this.launch(id, record, args, pool),
         release: () => release(),
       });
-      options.onQueued?.(id, this.queue.filter(e => e.pool === pool).length - 1);
+      try {
+        options.onQueued?.(id, this.queue.filter(e => e.pool === pool).length - 1);
+      } catch (err) {
+        this.abort(id);
+        throw err;
+      }
       return id;
     }
 
@@ -773,9 +807,18 @@ export class AgentManager {
    */
   private launch(id: string, record: AgentRecord, args: SpawnArgs, queuedPool: Pool | undefined): Promise<void> {
     const startup = this.startAgent(id, record, args).then(
-      () => { this.startups.delete(id); },
+      () => {
+        this.startups.delete(id);
+        // Stopped during asynchronous startup: no run promise will settle.
+        if (!record.promise && record.status !== "running" && record.status !== "queued") this.releaseReopening(id);
+      },
       (err) => {
         this.startups.delete(id);
+        // An onSpawned callback can throw after runAgent has started. That
+        // writer still owns the session until its run settles; do not drop its
+        // record or release the reservation on this startup error.
+        if (record.promise) throw err;
+        this.releaseReopening(id);
         if (queuedPool !== undefined) {
           // Mirrors settleRun: an inline caller gets this failure as a throw
           // out of spawnAndWait, so an unconsumed record would ALSO nudge the
@@ -1138,6 +1181,7 @@ export class AgentManager {
    * the acquire.
    */
   private settleRun(record: AgentRecord, guardCallback: boolean): void {
+    this.releaseReopening(record.id);
     this.settling.delete(record.id);
     record.resultRevision = (record.resultRevision ?? 0) + 1;
     if (!record.isBackground) { record.resultConsumed = true; record.consumedRevision = record.resultRevision; }
@@ -1710,6 +1754,7 @@ export class AgentManager {
       record.status = "stopped";
       this.dequeue(q => q.id === id);
       record.completedAt = Date.now();
+      this.releaseReopening(id);
       return true;
     }
 
@@ -1818,6 +1863,7 @@ export class AgentManager {
       if (record) {
         record.status = "stopped";
         record.completedAt = Date.now();
+        this.releaseReopening(record.id);
         count++;
       }
     }

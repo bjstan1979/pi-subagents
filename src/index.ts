@@ -20,7 +20,7 @@ import { abortable } from "./abortable.js";
 import { hasAgentBadge, renderAgentName } from "./agent-color.js";
 import { buildNewAgentFile, disableInContent, enableInContent, isEmptyStub, locateAgentFile, personalAgentsDir, projectAgentsDir, serializeAgentFile } from "./agent-file-toggle.js";
 import { AgentManager, isTopLevelAgent } from "./agent-manager.js";
-import { getAgentConversation, getDefaultMaxTurns, getGraceTurns, getRememberAgents, normalizeMaxTurns, resolveEffectiveMaxTurns, SUBAGENT_TOOL_NAMES, setDefaultMaxTurns, setGraceTurns, setRememberAgents, steerAgent } from "./agent-runner.js";
+import { getAgentConversation, getDefaultMaxTurns, getGraceTurns, getRememberAgents, normalizeMaxTurns, resolveDefaultModel, resolveEffectiveMaxTurns, SUBAGENT_TOOL_NAMES, setDefaultMaxTurns, setGraceTurns, setRememberAgents, steerAgent } from "./agent-runner.js";
 import { BUILTIN_TOOL_NAMES, getAgentConfig, getAllTypes, getAvailableTypes, getConfig, getFallbackSubagent, isDefaultsDisabled, NO_FALLBACK, registerAgents, resolveSpawnType, resolveType, setDefaultsDisabled, setFallbackSubagent } from "./agent-types.js";
 import { findCheckpointById } from "./checkpoint-discovery.js";
 import { CHECKPOINT_ENTRY_TYPE, type CheckpointEntry, CheckpointIndex } from "./checkpoint-index.js";
@@ -748,7 +748,14 @@ export default function (pi: ExtensionAPI) {
     const { state, callbacks } = createActivityTracker(resolveEffectiveMaxTurns(dispatch.type, options?.maxTurns));
     // Repaints are left to the manager's `onStart` callback, which already starts
     // the widget/fleet timers for agents that enter this way.
-    const id = manager.spawn(piRef, ctxRef, dispatch.type, prompt, { ...options, ...callbacks });
+    const onSessionCreated = callbacks.onSessionCreated;
+    const id = manager.spawn(piRef, ctxRef, dispatch.type, prompt, {
+      ...options, ...callbacks,
+      onSessionCreated: (session: any) => {
+        onSessionCreated?.(session);
+        options?.onSessionCreated?.(session);
+      },
+    });
     agentActivity.set(id, state);
     return id;
   };
@@ -1492,6 +1499,7 @@ export default function (pi: ExtensionAPI) {
     params: { prompt: string; max_turns?: number; run_in_background?: boolean; model?: string },
     signal: AbortSignal | undefined,
     hardLimit: boolean | undefined,
+    outputTranscript: boolean,
   ): Promise<string> {
     const entry = stored.entry;
     const label = stored.label;
@@ -1545,8 +1553,20 @@ export default function (pi: ExtensionAPI) {
       return manager.listTombstones().some(t => (t.handle === name || t.alias === name) && t.sessionFile !== entry.sessionFile);
     };
     const namesFree = !heldElsewhere(entry.handle) && !heldElsewhere(entry.alias);
+    let resumedId: string | undefined;
+    const attachOutput = (id: string) => {
+      resumedId = id;
+      const record = manager.getRecord(id);
+      if (!record || !outputTranscript) return;
+      record.outputFile = createOutputFilePath(ctx.cwd, id, ctx.sessionManager.getSessionId());
+      ensureOutputFile(record.outputFile);
+    };
     const spawnOptions = {
       description: entry.description || `Resumed ${label}`,
+      onSessionCreated: (session: any) => {
+        const record = resumedId ? manager.getRecord(resumedId) : undefined;
+        if (record?.outputFile) record.outputCleanup = streamToOutputFile(session, record.outputFile, record.id, ctx.cwd, session.messages.length);
+      },
       reclaim: namesFree && entry.handle ? { handle: entry.handle, alias: entry.alias } : undefined,
       resumeSessionFile: entry.sessionFile,
       model: params.model ? (() => {
@@ -1564,7 +1584,7 @@ export default function (pi: ExtensionAPI) {
     // settled record instead, exactly like a foreground spawn, and honor the
     // caller's abort signal: Esc must stop this child too.
     if (params.run_in_background === false) {
-      const { record } = await manager.spawnAndWait(pi, ctx, dispatch.type, params.prompt, { ...spawnOptions, signal });
+      const { record } = await manager.spawnAndWait(pi, ctx, dispatch.type, params.prompt, { ...spawnOptions, signal }, attachOutput);
       record.toolCallId = toolCallId;
       if (record.status === "error") {
         return `Resumed ${label} inline from its saved session, but the run failed: ${record.error}${partialOutputSuffix(record)}${resumableNote(record)}`;
@@ -1580,6 +1600,7 @@ export default function (pi: ExtensionAPI) {
     }
 
     const id = spawnResolved(pi, ctx, dispatch.type, params.prompt, { ...spawnOptions, isBackground: true });
+    attachOutput(id);
     const record = manager.getRecord(id);
     if (record) record.toolCallId = toolCallId;
     // A startup failure (unusable cwd, refused worktree) must surface as this
@@ -1615,6 +1636,8 @@ export default function (pi: ExtensionAPI) {
     if (opts.outputTranscript) {
       existing.outputFile = createOutputFilePath(ctx.cwd, id, ctx.sessionManager.getSessionId());
       ensureOutputFile(existing.outputFile);
+    } else {
+      existing.outputFile = undefined;
     }
     // Anchor streaming past the turns already on disk, captured BEFORE the
     // run starts. The resumed prompt lands as an ordinary user message at
@@ -2117,6 +2140,49 @@ Terse command-style prompts produce shallow, generic work.
       // Reload custom agents so new project/global .md files are picked up without restart
       reloadCustomAgents();
 
+      // Scheduling never reopens an existing conversation.
+      if (params.schedule && params.resume) {
+        return textResult("Cannot combine `schedule` with `resume` — schedules create fresh agents.");
+      }
+
+      // Resolve the actual conversation before deriving any invocation settings.
+      let existing: AgentRecord | undefined;
+      let stored: ReturnType<typeof lookupStoredEntry>;
+      if (params.resume) {
+        const ref = params.resume.trim().replace(/^@/, "");
+        existing = manager.getRecord(ref);
+        if (existing && !isTopLevelAgent(existing)) existing = undefined;
+        if (!existing) {
+          const mention = manager.resolveMention(ref);
+          if (mention?.kind === "live" && isTopLevelAgent(mention.record)) existing = mention.record;
+        }
+        stored = existing ? undefined : lookupStoredEntry(ref);
+        if (!existing && !stored) {
+          const sessionFile = ctx.sessionManager?.getSessionFile?.();
+          if (sessionFile) {
+            const checkpoint = await findCheckpointById(dirname(sessionFile), ref, ctx.cwd, signal);
+            if (checkpoint) stored = { kind: "checkpoint", entry: checkpoint, label: `@${checkpoint.alias ?? checkpoint.handle ?? checkpoint.id}` };
+          }
+        }
+        if (!existing && stored) {
+          // Compare canonical paths as checkpoints may use different spellings
+          // of the same file. Leave safety validation to resumeFromStore.
+          let target: string | undefined;
+          try {
+            target = realpathSync(stored.entry.sessionFile);
+            if (stored.kind === "checkpoint") {
+              const sessionFile = ctx.sessionManager?.getSessionFile?.();
+              const sessionDir = sessionFile ? realpathSync(dirname(sessionFile)) : undefined;
+              if (!sessionDir || !target.startsWith(sessionDir + sep) || !target.endsWith(".jsonl")) target = undefined;
+            }
+          } catch { /* missing or unverifiable file is reported below */ }
+          existing = manager.listAgents().find(r => {
+            if (!isTopLevelAgent(r) || !r.sessionFile || !target) return false;
+            try { return realpathSync(r.sessionFile) === target; } catch { return false; }
+          });
+        }
+        if (!existing && !stored) return textResult(`Agent not found: "${params.resume}". It may have been cleaned up.`);
+      }
       const rawType = params.subagent_type as SubagentType | undefined;
       // A missing type is legitimate ONLY on a resume, which continues the type
       // the conversation already has (see the resume branch). A fresh spawn has
@@ -2140,16 +2206,16 @@ Terse command-style prompts produce shallow, generic work.
       // background or scheduled call can't start running the wrong agent while
       // the caller is still unaware. `fallbackSubagent` decides whether an
       // unresolvable type falls back or fails closed.
-      const dispatch = resolveSpawnType(rawType);
+      const dispatch = params.resume
+        ? { ok: true as const, type: existing?.type ?? stored!.entry.type, fellBackFrom: undefined }
+        : resolveSpawnType(rawType);
       // `resume` replays a stored session and ignores `subagent_type` entirely,
       // so gating it here would make a live agent unresumable the moment its
       // type is deleted, disabled, or gains a case-clashing sibling. Only a real
       // spawn is gated.
       if (!dispatch.ok && !params.resume) return textResult(dispatch.message);
-      // Only the resume branch can still arrive without a type, and it ignores
-      // this value entirely — the empty string keeps the type below a `string`
-      // without pretending the caller named general-purpose.
-      const subagentType = dispatch.ok ? dispatch.type : (rawType ?? "");
+      // A resume uses the conversation's own type, even if it is no longer dispatchable.
+      const subagentType = params.resume ? (existing?.type ?? stored!.entry.type) : (dispatch.ok ? dispatch.type : (rawType ?? ""));
       // What the caller actually asked for, named once: `fellBackFrom` is "" for
       // a blank request, so reading it inline invites the `??`-vs-`||` slip that
       // once persisted an empty type into a scheduled job.
@@ -2175,7 +2241,7 @@ Terse command-style prompts produce shallow, generic work.
 
       // Resolve model from agent config first; tool-call params only fill gaps.
       let model = ctx.model;
-      if (resolvedConfig.modelInput) {
+      if (!params.resume && resolvedConfig.modelInput) {
         const resolved = resolveModel(resolvedConfig.modelInput, ctx.modelRegistry);
         if (typeof resolved === "string") {
           if (resolvedConfig.modelFromParams) return textResult(resolved);
@@ -2188,16 +2254,16 @@ Terse command-style prompts produce shallow, generic work.
       // Scope validation: the effective resolved model is checked against the
       // user's enabledModels list. Policy (hard error vs warn-and-proceed) lives
       // in model-scope.ts so the nested delegation tools apply the same rule.
-      const scopeVerdict = checkModelScope({
+      const scopeVerdict = !params.resume ? checkModelScope({
         model,
         cwd: ctx.cwd,
         modelRegistry: ctx.modelRegistry,
         callerSupplied: resolvedConfig.modelFromParams,
         agentLabel: customConfig?.displayName ?? subagentType,
         modelInput: resolvedConfig.modelInput,
-      });
-      if (scopeVerdict.kind === "error") return textResult(scopeVerdict.message);
-      if (scopeVerdict.kind === "warn") ctx.ui.notify(scopeVerdict.message, "warning");
+      }) : undefined;
+      if (scopeVerdict?.kind === "error") return textResult(scopeVerdict.message);
+      if (scopeVerdict?.kind === "warn") ctx.ui.notify(scopeVerdict.message, "warning");
 
       const thinking = resolvedConfig.thinking;
       const inheritContext = resolvedConfig.inheritContext;
@@ -2232,7 +2298,7 @@ Terse command-style prompts produce shallow, generic work.
         const resolvedAsked = resolveModel(asked, ctx.modelRegistry);
         if (typeof resolvedAsked === "string") return asked;
         return resolvedAsked.provider === model?.provider && resolvedAsked.id === model?.id ? undefined : asked;
-      })(resolvedConfig.overridden?.model);
+      })(params.resume ? undefined : resolvedConfig.overridden?.model);
       const effectiveMaxTurns = normalizeMaxTurns(resolvedConfig.maxTurns ?? getDefaultMaxTurns());
       const hardLimit = resolvedConfig.hardLimit;
       const agentInvocation: AgentInvocation = {
@@ -2338,42 +2404,27 @@ Terse command-style prompts produce shallow, generic work.
       if (params.resume) {
         const resumeModel = params.model ? resolveModel(params.model, ctx.modelRegistry) : undefined;
         if (typeof resumeModel === "string") return textResult(resumeModel);
+        if (resumeModel) {
+          const verdict = checkModelScope({ model: resumeModel, cwd: ctx.cwd, modelRegistry: ctx.modelRegistry,
+            callerSupplied: true, agentLabel: customConfig?.displayName ?? subagentType, modelInput: params.model });
+          if (verdict.kind === "error") return textResult(verdict.message);
+          if (verdict.kind === "warn") ctx.ui.notify(verdict.message, "warning");
+        }
         // Accept the id, handle or alias the result texts teach — including
         // the leading-@ spelling the resumable note suggests.
         const ref = params.resume.trim().replace(/^@/, "");
-        // An id first (the result texts teach ids), then a live handle/alias,
-        // then the trusted on-disk records this extension itself keeps: an
-        // in-session tombstone, or a checkpoint entry replayed from this
-        // session's own history.
-        let existing = manager.getRecord(ref);
-        if (existing && !isTopLevelAgent(existing)) existing = undefined;
-        if (!existing) {
-          const mention = manager.resolveMention(ref);
-          if (mention?.kind === "live" && isTopLevelAgent(mention.record)) existing = mention.record;
-        }
-        let stored = existing ? undefined : lookupStoredEntry(ref);
-        if (!existing && !stored) {
-          // A new parent session has no replayed index for older parents.
-          // Discover only an explicitly named id; never import foreign handles.
-          const sessionFile = ctx.sessionManager?.getSessionFile?.();
-          if (sessionFile) {
-            const checkpoint = await findCheckpointById(dirname(sessionFile), ref, ctx.cwd, signal);
-            if (checkpoint) stored = { kind: "checkpoint", entry: checkpoint, label: `@${checkpoint.alias ?? checkpoint.handle ?? checkpoint.id}` };
-          }
-        }
-        if (!existing && stored) {
-          // The saved conversation may already be open in this process: a
-          // first resume's record answers by its NEW id, while the OLD id
-          // keeps resolving to the stored entry here. Route to the holder
-          // instead of opening the same session file a second time — two
-          // writers appending one JSONL would fork the conversation.
-          const holder = manager.listAgents().find(r => isTopLevelAgent(r) && r.sessionFile === stored.entry.sessionFile);
-          if (holder) existing = holder;
-        }
         if (!existing) {
           try {
             if (stored) {
-              return textResult(await resumeFromStore(ctx, toolCallId, stored, params, signal, hardLimit));
+              if (!params.model) {
+                const configured = resolveDefaultModel(undefined, ctx.modelRegistry, customConfig?.model);
+                const selected = configured ?? ctx.model;
+                const verdict = checkModelScope({ model: selected, cwd: ctx.cwd, modelRegistry: ctx.modelRegistry,
+                  callerSupplied: false, agentLabel: customConfig?.displayName ?? subagentType,
+                  modelInput: configured ? customConfig?.model : undefined });
+                if (verdict.kind === "warn") ctx.ui.notify(verdict.message, "warning");
+              }
+              return textResult(await resumeFromStore(ctx, toolCallId, stored, { ...params, run_in_background: runInBackground }, signal, hardLimit, outputTranscript));
             }
           } catch (err) {
             return textResult(`Failed to resume "${ref}": ${err instanceof Error ? err.message : String(err)}`);
@@ -2392,21 +2443,11 @@ Terse command-style prompts produce shallow, generic work.
           );
         }
 
-        // Resume ignores subagent_type, but everything derived from it here was
-        // computed for the CALLER's type — or for the general-purpose landing
-        // spot of an omitted one. A continuation runs under the record's own
-        // type, so its frontmatter must decide, exactly as it already does for
-        // the `@handle` resume and for a stored reopen. Passing the call's
-        // values would let `output_transcript: false` on the agent being resumed
-        // lose to the project default, and would apply another agent's turn
-        // budget and hard-limit mode.
-        //
-        // Same precedence as the stored path, minus the invocation budget a
-        // record does not carry: the type's frontmatter, else the call, else the
-        // default.
+        // The record's current type configuration controls this continuation,
+        // including an explicit zero (unlimited) turn budget.
         const resumedConfig = getAgentConfig(existing.type);
         const resumeMaxTurns = normalizeMaxTurns(
-          resumedConfig?.maxTurns ?? (resolvedConfig.maxTurns === undefined ? undefined : effectiveMaxTurns) ?? getDefaultMaxTurns(),
+          resumedConfig?.maxTurns ?? params.max_turns ?? getDefaultMaxTurns(),
         );
         const resumeHardLimit = resumedConfig?.hardLimit ?? hardLimit;
         const resumeOutputTranscript = resumedConfig?.outputTranscript ?? getOutputTranscriptDefault();
@@ -2441,7 +2482,19 @@ Terse command-style prompts produce shallow, generic work.
           );
         }
 
+        if (resumeOutputTranscript) {
+          existing.outputFile = createOutputFilePath(ctx.cwd, existing.id, ctx.sessionManager.getSessionId());
+          ensureOutputFile(existing.outputFile);
+        } else {
+          existing.outputFile = undefined;
+        }
+        const transcriptAnchor = existing.session.messages.length;
         const record = await manager.resume(existing.id, params.prompt, signal, {
+          onStarted: () => {
+            if (existing.session && existing.outputFile) {
+              existing.outputCleanup = streamToOutputFile(existing.session, existing.outputFile, existing.id, ctx.cwd, transcriptAnchor);
+            }
+          },
           model: resumeModel,
           fallbackModel: ctx.model,
           onModelChange: (model, reason) => ctx.ui.notify(`Subagent ${existing.id} switched to ${model.provider}/${model.id} (${reason})`, "warning"),

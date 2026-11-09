@@ -14,6 +14,8 @@
  *   from the RESUMED type's frontmatter, not from the call — which used to be
  *   the caller's type (or general-purpose, once the field became optional).
  */
+import { writeFileSync } from "node:fs";
+import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 vi.mock("../src/agent-runner.js", async () => {
@@ -40,7 +42,9 @@ let hermetic: Hermetic | undefined;
 let booted: Map<string, any> | undefined;
 
 const AGENT_FILES = {
-  scout: "---\ndescription: Scout\nmax_turns: 2\noutput_transcript: false\n---\nScout.",
+  scout: "---\ndescription: Scout\nmax_turns: 2\nhard_limit: true\noutput_transcript: false\n---\nScout.",
+  conflicting: "---\ndescription: Conflicting\nmodel: test/allowed\nmax_turns: 9\nhard_limit: false\nrun_in_background: false\noutput_transcript: true\n---\nConflict.",
+  unlimited: "---\ndescription: Unlimited\nmax_turns: 0\n---\nUnlimited.",
 };
 
 /** A settled background agent, so it holds a resumable session. */
@@ -166,6 +170,45 @@ describe("resume without subagent_type", () => {
 
     const options = vi.mocked(resumeAgent).mock.calls[0][2] as any;
     expect(options.maxTurns).toBe(2);
+  });
+
+  it("ignores conflicting type configuration and uses caller mode when target has none", async () => {
+    const tools = boot();
+    const id = await spawnSettled(tools, "scout");
+    const result = await tools.get("Agent").execute("resume", {
+      prompt: "go", description: "go", resume: id, subagent_type: "conflicting",
+      run_in_background: true, max_turns: 8, hard_limit: false,
+    }, undefined, undefined, ctx());
+    expect(textOf(result)).toContain("resumed in background");
+    expect(vi.mocked(resumeAgent).mock.calls[0][2]).toMatchObject({ maxTurns: 2, hardLimit: true });
+  });
+
+  it("preserves the target's zero turn budget rather than the caller's", async () => {
+    const tools = boot();
+    const id = await spawnSettled(tools, "unlimited");
+    await tools.get("Agent").execute("resume", {
+      prompt: "go", description: "go", resume: id, subagent_type: "conflicting", max_turns: 7,
+      run_in_background: true,
+    }, undefined, undefined, ctx());
+    expect((vi.mocked(resumeAgent).mock.calls[0][2] as any).maxTurns).toBeUndefined();
+  });
+
+  it("rejects an explicit out-of-scope model even with conflicting pinned model", async () => {
+    const tools = boot();
+    const id = await spawnSettled(tools, "scout");
+    const { setScopeModelsEnabled } = await import("../src/model-scope.js");
+    const allowed = { provider: "test", id: "allowed" };
+    const denied = { provider: "test", id: "denied" };
+    writeFileSync(join(hermetic!.dir, ".pi", "settings.json"), JSON.stringify({ enabledModels: ["test/allowed"] }));
+    const registry = { find: vi.fn((_provider: string, id: string) => id === "allowed" ? allowed : id === "denied" ? denied : undefined), getAvailable: vi.fn(() => [allowed, denied]) };
+    setScopeModelsEnabled(true);
+    try {
+      const result = await tools.get("Agent").execute("resume", {
+        prompt: "go", description: "go", resume: id, subagent_type: "conflicting", model: "test/denied",
+      }, undefined, undefined, ctx({ modelRegistry: registry }));
+      expect(textOf(result)).toContain("Model not in scope");
+      expect(resumeAgent).not.toHaveBeenCalled();
+    } finally { setScopeModelsEnabled(false); }
   });
 
   it("keeps the RESUMED type's output_transcript gate", async () => {

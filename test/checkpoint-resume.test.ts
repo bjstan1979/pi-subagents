@@ -11,7 +11,7 @@
  * discarding the conversation, so every test asserts on `resumeSessionFile`
  * actually reaching runAgent, not just on the result text.
  */
-import { writeFileSync } from "node:fs";
+import { mkdirSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
@@ -23,6 +23,7 @@ vi.mock("../src/agent-runner.js", async () => {
 import { resumeAgent, runAgent } from "../src/agent-runner.js";
 import { CHECKPOINT_ENTRY_TYPE, CheckpointIndex, MAX_CHECKPOINTS } from "../src/checkpoint-index.js";
 import subagentsExtension from "../src/index.js";
+import * as outputFile from "../src/output-file.js";
 import { ctx, flush, type Hermetic, hermeticDir, makePi, textOf } from "./helpers/boot-extension.js";
 
 let hermetic: Hermetic | undefined;
@@ -258,6 +259,71 @@ describe("Agent tool resume — evicted and reopened sessions", () => {
     expect(text).toContain("Resumed @explore");
     const opts = vi.mocked(runAgent).mock.calls[0][3] as any;
     expect(opts.resumeSessionFile).toBe(sessionPath());
+  });
+
+  it.each([true, false])("reopens a stored target using its own configuration and transcript=%s", async (transcript) => {
+    const { tools, lifecycle } = boot({ outputTranscript: !transcript });
+    const ensure = vi.spyOn(outputFile, "ensureOutputFile");
+    mkdirSync(join(process.cwd(), ".pi", "agents"), { recursive: true });
+    writeFileSync(join(process.cwd(), ".pi", "agents", "saved.md"), `---\ndescription: Saved\nmax_turns: 0\nhard_limit: true\nrun_in_background: false\noutput_transcript: ${transcript}\n---\nSaved.`);
+    writeFileSync(join(process.cwd(), ".pi", "agents", "conflicting.md"), "---\ndescription: Conflict\nmax_turns: 9\nhard_limit: false\nrun_in_background: true\n---\nConflict.");
+    writeFileSync(sessionPath(), "");
+    const past = { id: "saved-id", handle: "saved", type: "saved", description: "saved", sessionFile: sessionPath(), status: "completed", completedAt: 1 };
+    const sctx = ctx({ sessionManager: { getSessionId: vi.fn(() => "s1"), getSessionFile: vi.fn(() => sessionPath()), getBranch: vi.fn(() => [{ type: "custom", customType: CHECKPOINT_ENTRY_TYPE, data: past }]) } });
+    await lifecycle.get("session_start")({ type: "session_start" }, sctx);
+    finishedRun();
+    const result = await tools.get("Agent").execute("resume", { resume: "saved-id", prompt: "go", subagent_type: "conflicting", max_turns: 7 }, undefined, undefined, sctx);
+    expect(textOf(result)).toContain("inline from its saved session");
+    const opts = vi.mocked(runAgent).mock.calls[0][3] as any;
+    expect(opts.resumeSessionFile).toBe(sessionPath());
+    expect(opts.maxTurns).toBeUndefined();
+    expect(opts.hardLimit).toBe(true);
+    expect(ensure).toHaveBeenCalledTimes(transcript ? 1 : 0);
+    ensure.mockRestore();
+  });
+
+  it("does not reopen the same stored JSONL while the first session is still starting", async () => {
+    const { tools, lifecycle } = boot();
+    writeFileSync(sessionPath(), "");
+    const past = { id: "race-id", handle: "saved", type: "Explore", description: "saved", sessionFile: sessionPath(), status: "completed", completedAt: 1 };
+    const sctx = ctx({ sessionManager: { getSessionId: vi.fn(() => "s1"), getSessionFile: vi.fn(() => sessionPath()), getBranch: vi.fn(() => [{ type: "custom", customType: CHECKPOINT_ENTRY_TYPE, data: past }]) } });
+    await lifecycle.get("session_start")({ type: "session_start" }, sctx);
+    let finish!: (value: any) => void;
+    vi.mocked(runAgent).mockImplementation(() => new Promise(resolve => { finish = resolve; }));
+    const args = { resume: "race-id", prompt: "go", run_in_background: true };
+    const first = await tools.get("Agent").execute("first", args, undefined, undefined, sctx);
+    const second = await tools.get("Agent").execute("second", args, undefined, undefined, sctx);
+    expect(textOf(first)).toContain("in the background");
+    expect(textOf(second)).toContain("already being reopened");
+    expect(runAgent).toHaveBeenCalledTimes(1);
+    finish({ responseText: "done", session: undefined, aborted: false, steered: false });
+    await flush();
+    finishedRun();
+    const retry = await tools.get("Agent").execute("retry", args, undefined, undefined, sctx);
+    expect(textOf(retry)).toContain("in the background");
+    expect(runAgent).toHaveBeenCalledTimes(2);
+  });
+
+  it.each(["configured", "parent", "missing-config"])("warns for the actual implicit stored model (%s)", async (source) => {
+    const { tools, lifecycle } = boot();
+    mkdirSync(join(process.cwd(), ".pi", "agents"), { recursive: true });
+    writeFileSync(join(process.cwd(), ".pi", "agents", "saved.md"), `---\ndescription: Saved\n${source === "configured" ? "model: test/denied\n" : source === "missing-config" ? "model: test/missing\n" : ""}---\nSaved.`);
+    writeFileSync(join(process.cwd(), ".pi", "settings.json"), JSON.stringify({ enabledModels: ["test/allowed"] }));
+    writeFileSync(sessionPath(), "");
+    const allowed = { provider: "test", id: "allowed" };
+    const denied = { provider: "test", id: "denied" };
+    const registry = { find: vi.fn((_provider: string, id: string) => id === "allowed" ? allowed : id === "denied" ? denied : undefined), getAvailable: vi.fn(() => [allowed, denied]) };
+    const past = { id: "model-id", handle: "saved", type: "saved", description: "saved", sessionFile: sessionPath(), status: "completed", completedAt: 1 };
+    const sctx = ctx({ model: source === "configured" ? allowed : denied, modelRegistry: registry, sessionManager: { getSessionId: vi.fn(() => "s1"), getSessionFile: vi.fn(() => sessionPath()), getBranch: vi.fn(() => [{ type: "custom", customType: CHECKPOINT_ENTRY_TYPE, data: past }]) } });
+    await lifecycle.get("session_start")({ type: "session_start" }, sctx);
+    const { setScopeModelsEnabled } = await import("../src/model-scope.js");
+    setScopeModelsEnabled(true);
+    try {
+      finishedRun();
+      const result = await tools.get("Agent").execute("resume", { resume: "model-id", prompt: "go", run_in_background: false }, undefined, undefined, sctx);
+      expect(textOf(result)).toContain("inline from its saved session");
+      expect(sctx.ui.notify).toHaveBeenCalledWith(expect.stringContaining('out-of-scope model "test/denied"'), "warning");
+    } finally { setScopeModelsEnabled(false); }
   });
 
   it("resumes an evicted agent inline when run_in_background is false", async () => {
