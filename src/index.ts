@@ -20,6 +20,7 @@ import { abortable } from "./abortable.js";
 import { hasAgentBadge, renderAgentName } from "./agent-color.js";
 import { buildNewAgentFile, disableInContent, enableInContent, isEmptyStub, locateAgentFile, personalAgentsDir, projectAgentsDir, serializeAgentFile } from "./agent-file-toggle.js";
 import { AgentManager, isTopLevelAgent } from "./agent-manager.js";
+import { AGENT_RECORD_ENTRY_TYPE, type AgentRecordEntryData, agentRecordEntryData, findTrustedAgentRecordEntry, formatSavedAgentRecord } from "./agent-record-entry.js";
 import { getAgentConversation, getDefaultMaxTurns, getGraceTurns, getRememberAgents, normalizeMaxTurns, resolveDefaultModel, resolveEffectiveMaxTurns, SUBAGENT_TOOL_NAMES, setDefaultMaxTurns, setGraceTurns, setRememberAgents, steerAgent } from "./agent-runner.js";
 import { BUILTIN_TOOL_NAMES, getAgentConfig, getAllTypes, getAvailableTypes, getConfig, getFallbackSubagent, isDefaultsDisabled, NO_FALLBACK, registerAgents, resolveSpawnType, resolveType, setDefaultsDisabled, setFallbackSubagent } from "./agent-types.js";
 import { findCheckpointById } from "./checkpoint-discovery.js";
@@ -596,6 +597,7 @@ export default function (pi: ExtensionAPI) {
   // into the NEW session afterwards; its checkpoint must not land there, or a
   // session that never spawned the agent replays it as its own on restart.
   let sessionStartedAt = 0;
+  let shuttingDown = false;
 
   // Background completion: route through group join or send individual nudge
   const manager = new AgentManager((record) => {
@@ -604,6 +606,9 @@ export default function (pi: ExtensionAPI) {
     // and dialog. Keep them out of top-level lifecycle, transcript,
     // notification, and UI channels.
     if (!isTopLevelAgent(record)) return;
+    // A run left over from a successfully replaced parent must not publish
+    // into this one. A cancellable before-switch event is not a boundary.
+    if (shuttingDown || !manager.isCurrentParent(record)) return;
 
     // Emit lifecycle event based on terminal status
     const isError = record.status === "error" || record.status === "stopped" || record.status === "aborted";
@@ -614,14 +619,13 @@ export default function (pi: ExtensionAPI) {
       pi.events.emit("subagents:completed", eventData);
     }
 
-    // Persist final record for cross-extension history reconstruction
-    pi.appendEntry("subagents:record", {
-      id: record.id, type: record.type, description: record.description,
-      status: record.status, result: record.result, error: record.error,
-      resultRevision: record.resultRevision ?? 1, consumedRevision: record.consumedRevision,
-      executionEpoch: record.executionEpoch ?? 1,
-      startedAt: record.startedAt, completedAt: record.completedAt,
-    });
+    // Persist the final record. It is legacy cross-extension history when the
+    // parent has no persisted session file, and a trust-stamped, read-only
+    // saved-result snapshot when it does: get_subagent_result answers from the
+    // latter once the live record is gone. No session path is ever stored here;
+    // resuming a conversation stays with the checkpoint/tombstone machinery.
+    const saved: AgentRecordEntryData = agentRecordEntryData(record);
+    pi.appendEntry<AgentRecordEntryData>(AGENT_RECORD_ENTRY_TYPE, saved);
 
     // Checkpoint: a settled agent with a persisted conversation stays resumable
     // by id/handle after eviction AND after this parent session itself is
@@ -859,6 +863,7 @@ export default function (pi: ExtensionAPI) {
       watchHandoffKey(ctx.ui);
     }
     manager.clearCompleted(true);
+    shuttingDown = false;
     sessionStartedAt = Date.now();
     // Replay this session's own checkpoint entries: agents settled before the
     // process exited stay resumable by id/handle after `--continue`/`--resume`.
@@ -1175,13 +1180,16 @@ export default function (pi: ExtensionAPI) {
   });
 
   pi.on("session_before_switch", () => {
-    manager.clearCompleted(true);
+    // Another extension may cancel this event. Preserve the historical sweep
+    // without advancing the publication generation until session_start.
+    manager.clearCompleted(true, false);
     scheduler.stop();
   });
 
   // On shutdown, abort all agents immediately and clean up.
   // If the session is going down, there's nothing left to consume agent results.
   pi.on("session_shutdown", async () => {
+    shuttingDown = true;
     rpcHandle?.unsubSpawn();
     rpcHandle?.unsubStop();
     rpcHandle?.unsubPing();
@@ -1654,6 +1662,7 @@ export default function (pi: ExtensionAPI) {
     // the parent turn is interrupted (user Esc), while agents started with
     // run_in_background in that same turn keep going.
     const record = await manager.resume(id, prompt, undefined, {
+      parentCtx: ctx,
       isBackground: true,
       model: opts.model,
       fallbackModel: ctx.model,
@@ -2490,6 +2499,7 @@ Terse command-style prompts produce shallow, generic work.
         }
         const transcriptAnchor = existing.session.messages.length;
         const record = await manager.resume(existing.id, params.prompt, signal, {
+          parentCtx: ctx,
           onStarted: () => {
             if (existing.session && existing.outputFile) {
               existing.outputCleanup = streamToOutputFile(existing.session, existing.outputFile, existing.id, ctx.cwd, transcriptAnchor);
@@ -3293,9 +3303,35 @@ Terse command-style prompts produce shallow, generic work.
         }),
       ),
     }),
-    execute: async (_toolCallId, params, signal, _onUpdate, _ctx) => {
-      const record = resolveAgentRef(params.agent_id);
+    execute: async (_toolCallId, params, signal, _onUpdate, ctx) => {
+      const exactLive = manager.getRecord(params.agent_id);
+      const exactSaved = exactLive ? undefined : findTrustedAgentRecordEntry(ctx, params.agent_id);
+      const record = exactSaved ? undefined : resolveAgentRef(params.agent_id);
       if (!record || !isTopLevelAgent(record)) {
+        // Read-only saved-result fallback, ACTIVE BRANCH ONLY. Priority: a
+        // trusted exact-ID record; then a trusted handle/alias match whose
+        // newest completion wins; then a local tombstone/checkpoint name→ID.
+        // Cross-parent exact-ID checkpoint
+        // discovery stays a RESUME source in the Agent tool — it is deliberately
+        // NOT a result source here, and no file is opened by this read. A saved
+        // hit cancels the matching pending notification but never appends or
+        // consumes the saved result — reads are repeatable.
+        let savedHit = exactSaved ?? findTrustedAgentRecordEntry(ctx, params.agent_id, { matchNames: true });
+        if (!savedHit) {
+          const mention = manager.resolveMention(params.agent_id);
+          const byStoredId = mention?.kind === "tombstone"
+            ? mention.entry.id
+            : checkpointIndex.get(params.agent_id)?.id;
+          if (byStoredId) savedHit = findTrustedAgentRecordEntry(ctx, byStoredId);
+        }
+        if (savedHit) {
+          const key = `${savedHit.id}:${savedHit.resultRevision ?? 1}`;
+          cancelNudge(key);
+          if (pendingBatchCompletions.get(savedHit.id)?.resultRevision === (savedHit.resultRevision ?? 1)) {
+            pendingBatchCompletions.delete(savedHit.id);
+          }
+          return textResult(formatSavedAgentRecord(savedHit));
+        }
         const stored = !record ? lookupStoredEntry(params.agent_id) : undefined;
         if (stored) {
           return textResult(
@@ -3304,7 +3340,7 @@ Terse command-style prompts produce shallow, generic work.
             "Resume starts another run; it is not a read-only result lookup. The saved session will be validated before reopening.",
           );
         }
-        return textResult(`Agent not found: "${params.agent_id}". No live result or stored checkpoint is available in this session. Use the exact ID returned by Agent; do not invent an ID.`);
+        return textResult(`Agent not found: "${params.agent_id}". No live result or saved record is available in this session. Use the exact ID returned by Agent; do not invent an ID.`);
       }
 
       // Wait for completion if requested. Cancellation stops only this tool

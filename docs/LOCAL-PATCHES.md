@@ -19,7 +19,7 @@ No post-release master features were imported.
 | `a90f3eb` | `1527d3e` | Retain structured recovery and saved tool scope across resume. |
 | `9a182a9` | not replayed | Obsolete mention-clone transcript mutation: upstream already seeds `getBranch()` into `SessionManager.inMemory`. |
 
-Accepted exclusions remain unchanged: r0010 autonomous continuation, GEN-042, and `get_subagent_result` caching. Workflow ceiling/resume plumbing and fixtures remain retained even if workflows are disabled in deployed settings.
+Accepted exclusions remain unchanged: r0010 autonomous continuation, GEN-042, and persistent `get_subagent_result` result caching. The third selective upstream result-fallback port adds a **read-only saved-record lookup** (no cache, no consumption merge, no session reopening): trust-stamped `subagents:record` snapshots on the active branch answer `get_subagent_result` after eviction/reload, with exact-ID priority and case-insensitive handle/alias latest-wins. Upstream's `sessionFile` / `worktreeLost` / `reopenTarget` / `Agent({resume})` reopen path is deliberately NOT ported; exact-ID-only cross-parent checkpoint recovery stays with the checkpoint machinery. Legacy/polluted records remain untrusted. Workflow ceiling/resume plumbing and fixtures remain retained even if workflows are disabled in deployed settings.
 
 ## Upstream 0.21 adaptations
 

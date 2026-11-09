@@ -684,6 +684,38 @@ describe("Agent tool resume — review regressions", () => {
     );
     expect(textOf(r)).toContain("resumed inline answer");
   });
+
+  it("a trust-stamped saved RESULT record never becomes a resume target", async () => {
+    // The selective saved-result port is read-only: a `subagents:record` entry
+    // (with or without a trust block) is never a session-reopen source. Only
+    // checkpoints/tombstones are, and cross-parent recovery stays exact-ID only.
+    const { tools, lifecycle } = boot();
+    const recordId = "result-only-agent";
+    const branch = [{
+      type: "custom", customType: "subagents:record",
+      data: {
+        id: recordId, type: "Explore", handle: "explore", alias: "result-alias",
+        description: "result only", status: "completed", result: "saved text",
+        startedAt: 1, completedAt: 2,
+        trust: {
+          version: 1, switchEpoch: 0, parentEpoch: "x", parentSessionId: "s1",
+          parentSessionFile: sessionPath(), parentCwd: process.cwd(),
+        },
+      },
+    }];
+    const sctx = ctx({ sessionManager: {
+      getSessionId: vi.fn(() => "s1"), getSessionFile: vi.fn(() => sessionPath()),
+      getBranch: vi.fn(() => branch),
+    } });
+    await lifecycle.get("session_start")({ type: "session_start" }, sctx);
+    finishedRun();
+    const r = await tools.get("Agent").execute(
+      "tc-rr9", { resume: recordId, prompt: "continue" }, undefined, undefined, sctx,
+    );
+    // Ordinary not-found: no session was reopened, no new run started.
+    expect(textOf(r)).toContain("Agent not found");
+    expect(runAgent).not.toHaveBeenCalled();
+  });
 });
 
 describe("Agent tool resume — untouched paths", () => {

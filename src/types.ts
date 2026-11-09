@@ -299,6 +299,19 @@ export interface AgentRecord {
    * directory as their ancestors' instead of the child session's own id.
    */
   rootSessionId?: string;
+  /**
+   * Parent-session identity captured at spawn for the trust-stamped
+   * `subagents:record` result fallback. `switchEpoch` is the manager's
+   * parentGeneration; the rest are the canonical parent identity and its
+   * derived epoch. All optional: records from contexts without a persisted
+   * parent session file (in-memory/print/programmatic) stay legacy history and
+   * are never readable as saved results. See `src/agent-record-entry.ts`.
+   */
+  switchEpoch?: number;
+  parentEpoch?: string;
+  parentSessionId?: string;
+  parentSessionFile?: string;
+  parentCwd?: string;
 }
 
 /**

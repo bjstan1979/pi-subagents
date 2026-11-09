@@ -50,15 +50,20 @@ function makePi() {
   return { pi, tools, lifecycle, events };
 }
 
-function ctx() {
+function ctx(overrides: Record<string, unknown> = {}) {
   return {
     hasUI: false,
     ui: { setStatus: vi.fn(), setWidget: vi.fn(), notify: vi.fn() },
     cwd: process.cwd(),
     model: undefined,
     modelRegistry: { find: vi.fn(), getAvailable: vi.fn(() => []) },
-    sessionManager: { getSessionId: vi.fn(() => "s1"), getBranch: vi.fn(() => []) },
+    sessionManager: {
+      getSessionId: vi.fn(() => "s1"),
+      getSessionFile: vi.fn(() => join(process.cwd(), "parent-session.jsonl")),
+      getBranch: vi.fn(() => []),
+    },
     getSystemPrompt: vi.fn(() => "parent"),
+    ...overrides,
   } as any;
 }
 
@@ -110,6 +115,8 @@ describe("issue #108: unread completed background agents survive session events"
     prevCwd = process.cwd();
     mkdirSync(join(tmpDir, ".pi"), { recursive: true });
     writeFileSync(join(tmpDir, ".pi", "subagents.json"), JSON.stringify({ schedulingEnabled: false }));
+    // Persisted parent file so settle-time result records are trust-stamped.
+    writeFileSync(join(tmpDir, "parent-session.jsonl"), "");
     process.chdir(tmpDir);
   });
 
@@ -170,6 +177,52 @@ describe("issue #108: unread completed background agents survive session events"
     const second = await tools.get("get_subagent_result").execute("tc-read2", { agent_id: id }, undefined, undefined, ctx());
     expect(textOf(second)).toContain("Agent not found");
 
+    await lifecycle.get("session_shutdown")?.({}, ctx());
+  });
+
+  it("a stale run settling after /new publishes no record into the new parent", async () => {
+    const { pi, tools, lifecycle } = makePi();
+    subagentsExtension(pi);
+    let finish!: (value: any) => void;
+    vi.mocked(runAgent).mockImplementation(() => new Promise(resolve => { finish = resolve; }));
+    const spawn = await tools.get("Agent").execute(
+      "tc-stale",
+      { prompt: "go", description: "old parent work", subagent_type: "general-purpose", run_in_background: true },
+      undefined, undefined, ctx(),
+    );
+    const staleId = /Agent ID: (\S+)/.exec(textOf(spawn))![1];
+    await flush();
+
+    // The /new boundary: parentSwitching is armed and parentGeneration bumps.
+    await lifecycle.get("session_before_switch")?.();
+    await lifecycle.get("session_start")?.({}, ctx());
+    vi.mocked(pi.appendEntry).mockClear();
+    pi.events.emit.mockClear();
+
+    finish({ responseText: "STALE-RESULT", session: { dispose: vi.fn() }, aborted: false, steered: false });
+    await flush();
+
+    // No result record OR checkpoint was published into the new parent's branch.
+    expect(pi.appendEntry).not.toHaveBeenCalled();
+    expect(pi.events.emit).not.toHaveBeenCalledWith("subagents:completed", expect.objectContaining({ id: staleId }));
+
+    // The still-running record is intentionally preserved as LIVE by
+    // clearCompleted(true) (issue #108), so it stays readable in this process.
+    // What the guard guarantees is that no saved copy exists: after a reload,
+    // with an empty branch, the id is ordinary not-found.
+    const live = await tools.get("get_subagent_result").execute("tc-read3", { agent_id: staleId }, undefined, undefined, ctx());
+    expect(textOf(live)).toContain("STALE-RESULT");
+
+    const freshBranch: any[] = [];
+    const { pi: pi2, tools: tools2 } = makePi();
+    pi2.appendEntry = vi.fn((customType: string, data: unknown) => freshBranch.push({ type: "custom", customType, data }));
+    subagentsExtension(pi2);
+    const afterReload = await tools2.get("get_subagent_result").execute("tc-read4", { agent_id: staleId }, undefined, undefined, ctx({ sessionManager: {
+      getSessionId: vi.fn(() => "s1"),
+      getSessionFile: vi.fn(() => join(process.cwd(), "parent-session.jsonl")),
+      getBranch: vi.fn(() => freshBranch),
+    } }));
+    expect(textOf(afterReload)).toContain("Agent not found");
     await lifecycle.get("session_shutdown")?.({}, ctx());
   });
 });

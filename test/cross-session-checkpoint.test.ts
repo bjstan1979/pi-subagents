@@ -68,6 +68,21 @@ describe("findCheckpointById — cross-session ID recovery", () => {
     },
   );
 
+  it("keeps checkpoint discovery exact-ID-only and free of result snapshots", async () => {
+    // The selective saved-result port reads the ACTIVE BRANCH and never calls
+    // findCheckpointById. A result-record entry in an older parent must stay
+    // invisible to cross-parent ID recovery: discovery is a RESUME source only,
+    // and only for `subagents:checkpoint` entries.
+    const resultOnly = {
+      type: "custom", id: "result-entry", parentId: null,
+      timestamp: "2026-01-01T00:00:01.000Z", customType: "subagents:record",
+      data: { id: "result-agent-id", type: "Explore", description: "result", status: "completed", result: "text", startedAt: 1, completedAt: 2 },
+    };
+    parentFile("older-parent.jsonl", [resultOnly, message("tip", "result-entry")]);
+    expect(await findCheckpointById(sessionDir, "result-agent-id", cwd)).toBeUndefined();
+    expect(await findCheckpointById(sessionDir, "saved-agent-id", cwd)).toBeUndefined();
+  });
+
   it("does not let a newer handle/alias collision shadow an exact ID", async () => {
     const saved = checkpoint();
     parentFile("older-parent.jsonl", [

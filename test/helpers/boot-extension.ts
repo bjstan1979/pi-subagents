@@ -89,7 +89,13 @@ export function ctx(overrides: Record<string, unknown> = {}) {
     cwd: process.cwd(),
     model: undefined,
     modelRegistry: { find: vi.fn(), getAvailable: vi.fn(() => []) },
-    sessionManager: { getSessionId: vi.fn(() => "s1"), getBranch: vi.fn(() => []) },
+    // A real, canonical parent session file inside the hermetic cwd: the
+    // trust-stamped saved-result fallback derives parent identity from it.
+    sessionManager: {
+      getSessionId: vi.fn(() => "s1"),
+      getSessionFile: vi.fn(() => join(process.cwd(), "parent-session.jsonl")),
+      getBranch: vi.fn(() => []),
+    },
     getSystemPrompt: vi.fn(() => "parent"),
     ...overrides,
   } as any;
@@ -125,6 +131,8 @@ export function hermeticDir(opts: {
   const prevHome = process.env.HOME;
 
   mkdirSync(join(dir, ".pi"), { recursive: true });
+  // Persisted parent session file — see ctx()'s getSessionFile above.
+  writeFileSync(join(dir, "parent-session.jsonl"), "");
   if (opts.settings) {
     writeFileSync(join(dir, ".pi", "subagents.json"), JSON.stringify(opts.settings));
   }

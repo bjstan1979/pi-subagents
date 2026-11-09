@@ -500,7 +500,7 @@ Concurrency is capped at `max(1, min(16, cpus - 2))` — the run's own limit, in
 
 ### `get_subagent_result`
 
-Check status and retrieve results from a background agent. If only a current-session checkpoint or tombstone remains, the tool explains how to use `Agent({ resume: "<exact-id>", prompt: "..." })`. It does not reopen the conversation automatically: resume starts another run, not a read-only result lookup, and still validates the saved session path.
+Check status and retrieve results from a background agent. Once the live record is gone (ten-minute eviction, reload, restart), it answers from the trust-stamped `subagents:record` entry on the current parent's active branch — by exact ID, or by a case-insensitive handle/alias whose newest completion wins. The saved read is repeatable: it never appends, consumes, caches, or reopens a child session, but cancels a matching pending completion notification. The identity stamp filters mismatched records; it is not authentication against another extension that can write session entries. Live records retain their existing cross-session behavior. Legacy entries without a v1 trust block, records from another parent session, and anything on an abandoned branch stay ordinary `Agent not found`; the result snapshot carries no session path and is never a resume source. If only a current-session checkpoint or tombstone remains, the tool explains how to use `Agent({ resume: "<exact-id>", prompt: "..." })`: resume starts another run, not a read-only result lookup, and still validates the saved session path.
 
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|
