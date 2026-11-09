@@ -1818,7 +1818,7 @@ ${buildTypeListText()}
 
 Custom agents can be defined in .pi/agents/<name>.md (project) or ${getAgentDir()}/agents/<name>.md (global) — they are picked up automatically. Project-level agents override global ones. Creating a .md file with the same name as a default agent overrides it.
 
-When using the Agent tool, specify a subagent_type parameter to select which agent type to use.
+When starting a new agent with the Agent tool, specify a subagent_type parameter to select which agent type to use. A resume does not need one: the agent keeps the type it was started with.
 
 ## When not to use
 
@@ -1833,7 +1833,7 @@ If the target is already known, use a direct tool — \`read\` for a known path,
 - Agents run in the background by default. When an agent runs in the background, you will be automatically notified when it completes — do NOT sleep, poll, or proactively check on its progress. Continue with other work or respond to the user instead.
 - **Foreground vs background**: Pass \`run_in_background: false\` only when your very next action depends on the agent's result and nothing else could usefully happen while it runs — e.g., a research agent whose finding gates the edit you're about to make. Otherwise let it run in the background (the default) — this includes fire-and-forget work, independent investigations, and anything where the user might hand you something else in the meantime. Wanting the result "next" is not enough on its own.
 - **Don't race**: after launching a background agent, you know nothing about its results. Never fabricate or predict them in any format — not as prose, summary, or structured output. The completion notification arrives in a later turn; it is never something you write yourself. If the user asks before it lands, say the agent is still running — give status, not a guess.
-- Use resume with an agent ID to continue a previous agent's work. A new (non-resume) Agent call starts a fresh agent with no memory of prior runs, so the prompt must be self-contained.
+- Use resume with an agent ID to continue a previous agent's work. Omit subagent_type there — the agent keeps the type it was started with. A new (non-resume) Agent call starts a fresh agent with no memory of prior runs, so the prompt must be self-contained.
 - Use steer_subagent to send mid-run messages to a running background agent.
 - Clearly tell the agent whether you expect it to write code or just to do research (search, file reads, etc.), since it is not aware of the user's intent.
 - If an agent's description says it should be used proactively, try to use it without the user having to ask for it first.
@@ -1929,9 +1929,17 @@ Terse command-style prompts produce shallow, generic work.
             'Optional memorable name for this agent, e.g. "auth-audit", so it can be addressed as `@name` at the prompt and by steer_subagent / get_subagent_result. Letters, digits, `_` and `-`. Worth setting when several agents of the same type run at once; omit for one-off work. The agent stays reachable by its type either way.',
         }),
       ),
-      subagent_type: Type.String({
-        description: `The type of specialized agent to use. Available types: ${getAvailableTypes().join(", ")}. Custom agents from .pi/agents/*.md (project) or ${getAgentDir()}/agents/*.md (global) are also available.`,
-      }),
+      // Optional only so a resume can leave it out: `resume` continues a
+      // conversation that already has a type, and restating it was pure
+      // ceremony that a schema-level `required` turned into a failed call —
+      // the model forgot the field once per resume and lost a whole turn to it.
+      // A fresh spawn still has no type to continue from, so `execute` refuses a
+      // missing one instead of leaving the decision to the schema.
+      subagent_type: Type.Optional(
+        Type.String({
+          description: `The type of specialized agent to use. Required to start a new agent; omit it when resuming, where the agent keeps the type it was started with. Available types: ${getAvailableTypes().join(", ")}. Custom agents from .pi/agents/*.md (project) or ${getAgentDir()}/agents/*.md (global) are also available.`,
+        }),
+      ),
       model: Type.Optional(
         Type.String({
           description:
@@ -2109,7 +2117,24 @@ Terse command-style prompts produce shallow, generic work.
       // Reload custom agents so new project/global .md files are picked up without restart
       reloadCustomAgents();
 
-      const rawType = params.subagent_type as SubagentType;
+      const rawType = params.subagent_type as SubagentType | undefined;
+      // A missing type is legitimate ONLY on a resume, which continues the type
+      // the conversation already has (see the resume branch). A fresh spawn has
+      // nothing to continue, so the omission is refused here rather than passed
+      // to `fallbackSubagent`: the model did not ask for general-purpose, it
+      // forgot the parameter, and silently spawning an agent of another type is
+      // exactly what #183 is about — worst of all in the background, where the
+      // substituted agent is already running before the caller reads anything.
+      // An explicitly blank string is NOT treated as missing: it keeps its
+      // historical fallback, which `fallback-subagent-wiring.test.ts` pins as the
+      // scheduler's contract.
+      if (rawType === undefined && !params.resume) {
+        return textResult(
+          `subagent_type is required to start a new agent; omit it only when resuming, ` +
+          `where the agent keeps the type it was started with. ` +
+          `Available: ${getAvailableTypes().join(", ") || "(none)"}.`,
+        );
+      }
       // Single decision point for dispatch (#183): unknown, disabled and
       // case-ambiguous types are refused here, BEFORE anything spawns, so a
       // background or scheduled call can't start running the wrong agent while
@@ -2117,11 +2142,14 @@ Terse command-style prompts produce shallow, generic work.
       // unresolvable type falls back or fails closed.
       const dispatch = resolveSpawnType(rawType);
       // `resume` replays a stored session and ignores `subagent_type` entirely,
-      // but the parameter is required by the schema — so gating it here would
-      // make a live agent unresumable the moment its type is deleted, disabled,
-      // or gains a case-clashing sibling. Only a real spawn is gated.
+      // so gating it here would make a live agent unresumable the moment its
+      // type is deleted, disabled, or gains a case-clashing sibling. Only a real
+      // spawn is gated.
       if (!dispatch.ok && !params.resume) return textResult(dispatch.message);
-      const subagentType = dispatch.ok ? dispatch.type : rawType;
+      // Only the resume branch can still arrive without a type, and it ignores
+      // this value entirely — the empty string keeps the type below a `string`
+      // without pretending the caller named general-purpose.
+      const subagentType = dispatch.ok ? dispatch.type : (rawType ?? "");
       // What the caller actually asked for, named once: `fellBackFrom` is "" for
       // a blank request, so reading it inline invites the `??`-vs-`||` slip that
       // once persisted an empty type into a scheduled job.
@@ -2364,6 +2392,25 @@ Terse command-style prompts produce shallow, generic work.
           );
         }
 
+        // Resume ignores subagent_type, but everything derived from it here was
+        // computed for the CALLER's type — or for the general-purpose landing
+        // spot of an omitted one. A continuation runs under the record's own
+        // type, so its frontmatter must decide, exactly as it already does for
+        // the `@handle` resume and for a stored reopen. Passing the call's
+        // values would let `output_transcript: false` on the agent being resumed
+        // lose to the project default, and would apply another agent's turn
+        // budget and hard-limit mode.
+        //
+        // Same precedence as the stored path, minus the invocation budget a
+        // record does not carry: the type's frontmatter, else the call, else the
+        // default.
+        const resumedConfig = getAgentConfig(existing.type);
+        const resumeMaxTurns = normalizeMaxTurns(
+          resumedConfig?.maxTurns ?? (resolvedConfig.maxTurns === undefined ? undefined : effectiveMaxTurns) ?? getDefaultMaxTurns(),
+        );
+        const resumeHardLimit = resumedConfig?.hardLimit ?? hardLimit;
+        const resumeOutputTranscript = resumedConfig?.outputTranscript ?? getOutputTranscriptDefault();
+
         // Background resume: detached run that notifies on completion, mirroring
         // a background spawn. Previously run_in_background was silently ignored
         // on resume (this branch returned before the background branch below),
@@ -2371,9 +2418,9 @@ Terse command-style prompts produce shallow, generic work.
         if (runInBackground) {
           const id = existing.id;
           const record = await startBackgroundResume(ctx, existing, params.prompt, {
-            outputTranscript,
-            maxTurns: effectiveMaxTurns,
-            hardLimit,
+            outputTranscript: resumeOutputTranscript,
+            maxTurns: resumeMaxTurns,
+            hardLimit: resumeHardLimit,
             toolCallId,
             model: resumeModel,
           });
@@ -2398,8 +2445,8 @@ Terse command-style prompts produce shallow, generic work.
           model: resumeModel,
           fallbackModel: ctx.model,
           onModelChange: (model, reason) => ctx.ui.notify(`Subagent ${existing.id} switched to ${model.provider}/${model.id} (${reason})`, "warning"),
-          maxTurns: effectiveMaxTurns,
-          hardLimit,
+          maxTurns: resumeMaxTurns,
+          hardLimit: resumeHardLimit,
         });
         if (!record) {
           return textResult(`Failed to resume agent "${params.resume}".`);

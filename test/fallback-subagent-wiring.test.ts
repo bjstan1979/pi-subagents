@@ -207,9 +207,9 @@ describe("fallbackSubagent gates dispatch through the real Agent tool", () => {
   });
 
   it("never blocks resume, which ignores subagent_type entirely", async () => {
-    // resume replays a stored session; the type is required by the schema but
-    // unused. Gating it would make a live agent unresumable the moment its type
-    // is deleted or disabled — the opposite of what strict dispatch is for.
+    // resume replays a stored session and does not read the type at all. Gating
+    // it would make a live agent unresumable the moment its type is deleted or
+    // disabled — the opposite of what strict dispatch is for.
     const { tools } = boot();
     vi.mocked(runAgent).mockResolvedValue({
       // `messages` is not optional on a real AgentSession, and a background

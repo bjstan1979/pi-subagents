@@ -167,7 +167,12 @@ export function createNestedSubagentTools(context: NestedToolContext): ToolDefin
     parameters: Type.Object({
       prompt: Type.String({ description: "Self-contained task for the nested agent." }),
       description: Type.String({ description: "Short 3-5 word task description." }),
-      subagent_type: Type.String({ description: `Allowed nested agent type. Available: ${availableIn(loadRegistry()).join(", ") || "none"}.` }),
+      // Optional for the same reason as the top-level tool: a nested resume
+      // continues a child that already has a type, and restating it was a
+      // required field that failed the call when the model left it out.
+      subagent_type: Type.Optional(
+        Type.String({ description: `Allowed nested agent type. Required to start a new child; omit it when resuming. Available: ${availableIn(loadRegistry()).join(", ") || "none"}.` }),
+      ),
       model: Type.Optional(Type.String({ description: "Optional provider/model override." })),
       thinking: Type.Optional(Type.String({ description: "Optional thinking level." })),
       max_turns: Type.Optional(Type.Number({ minimum: 1 })),
@@ -221,6 +226,18 @@ export function createNestedSubagentTools(context: NestedToolContext): ToolDefin
       // Reloaded per call so new agent files are picked up without a restart.
       const registry = loadRegistry();
       const rawType = params.subagent_type;
+      // Resume continues the child's own type, so a missing one is only an error
+      // for a fresh spawn — and there it is an error of omission, not a request
+      // for general-purpose: this path never falls back, so naming the allowed
+      // types is the whole fix.
+      if (rawType === undefined) {
+        return textResult(
+          `subagent_type is required to start a nested agent; omit it only when resuming, ` +
+          `where the child keeps the type it was started with. ` +
+          `Allowed: ${availableIn(registry).join(", ") || "none"}.`,
+          true,
+        );
+      }
       // Strict resolve, never the fallback policy: a project-level
       // `fallbackSubagent` must not hand a nested caller an agent its allowlist
       // never named. The list stays allowlist-filtered so a typo can't enumerate

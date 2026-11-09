@@ -417,6 +417,41 @@ describe("child-safe nested Agent tools", () => {
     settleChild?.();
   });
 
+  it("resumes without a subagent_type, since the child keeps its own", async () => {
+    const [agent] = tools(["scout"]);
+    records.set("child-own", {
+      id: "child-own",
+      status: "completed",
+      result: "initial done",
+      parentAgentId: "parent-1",
+      session: { steer: vi.fn() },
+    });
+    vi.mocked(manager.resume).mockResolvedValueOnce(records.get("child-own")!);
+
+    // The field was required by the schema while the resume branch ignored it,
+    // so omitting it cost the caller a whole rejected call.
+    const result = await execute(agent, {
+      resume: "child-own",
+      description: "resume without type",
+      prompt: "Continue",
+    });
+
+    expect(result.isError).toBe(false);
+    expect(manager.resume).toHaveBeenCalledTimes(1);
+  });
+
+  it("refuses a fresh nested spawn with no subagent_type instead of guessing", async () => {
+    const [agent] = tools(["scout"]);
+
+    const result = await execute(agent, { description: "no type", prompt: "Do work" });
+
+    expect(result.isError).toBe(true);
+    expect(result.content[0].text).toContain("subagent_type is required to start a nested agent");
+    expect(result.content[0].text).toContain("scout");
+    expect(spawnAndWait).not.toHaveBeenCalled();
+    expect(spawn).not.toHaveBeenCalled();
+  });
+
   it("still rejects unknown types when the project configures a fallback", async () => {
     // The contract nested delegation documents is "rejected rather than falling
     // back" — a top-level fallback must not hand a nested caller an agent its
