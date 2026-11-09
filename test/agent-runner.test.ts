@@ -1821,6 +1821,116 @@ describe("agent-runner async extension tool registration", () => {
   });
 });
 
+// ─── bare `mcp__` entries in tools: (Claude Code style) ─────────────────
+// Such an entry narrows MCP tools to the matching ones and leaves every other
+// extension tool to the usual local rules, including the hard-limit gate.
+describe("agent-runner bare mcp__ entries in tools:", () => {
+  function setup(o: { mcpToolPatterns?: string[]; extSelectors?: string[]; disallowedTools?: string[] } = {}) {
+    vi.mocked(getConfig).mockReturnValueOnce(makeConfig({ extensions: true }));
+    vi.mocked(getAgentConfig).mockReturnValueOnce(makeAgentConfig({ extensions: true, ...o }));
+    vi.mocked(getToolNamesForType).mockReturnValueOnce(["read"]);
+  }
+
+  async function activeAfterRun(): Promise<string[]> {
+    const { session } = createSession("OK");
+    createAgentSession.mockResolvedValue({ session });
+    await runAgent(ctx, "Explore", "go", { pi });
+    return session.getActiveToolNames();
+  }
+
+  it("keeps only the named MCP tool and leaves non-MCP extension tools alone", async () => {
+    setup({ mcpToolPatterns: ["mcp__srv__keep"] });
+    withExtensions({ "/ext/mcp.ts": ["mcp__srv__keep", "mcp__srv__drop"], "/ext/other.ts": ["other_tool"] });
+
+    const active = await activeAfterRun();
+
+    expect(active).toContain("mcp__srv__keep");
+    expect(active).not.toContain("mcp__srv__drop");
+    expect(active).toContain("other_tool");
+  });
+
+  it("matches `*` patterns, as pi's --tools does", async () => {
+    setup({ mcpToolPatterns: ["mcp__srv__*"] });
+    withExtensions({ "/ext/mcp.ts": ["mcp__srv__a", "mcp__srv__b", "mcp__other__c"] });
+
+    const active = await activeAfterRun();
+
+    expect(active).toEqual(expect.arrayContaining(["mcp__srv__a", "mcp__srv__b"]));
+    expect(active).not.toContain("mcp__other__c");
+  });
+
+  it("admits the named MCP tool and its bridges through the ext: opt-in", async () => {
+    setup({ mcpToolPatterns: ["mcp__srv__keep"], extSelectors: ["ext:foo"] });
+    withExtensions({
+      "/ext/foo.ts": ["foo_tool"],
+      "/ext/mcp.ts": ["mcp__srv__keep", "mcp__srv__drop"],
+      "/ext/bridges.ts": ["codemode", "tool_search", "bridge_sibling"],
+    });
+
+    const active = await activeAfterRun();
+
+    expect(active).toEqual(expect.arrayContaining(["foo_tool", "mcp__srv__keep", "codemode", "tool_search"]));
+    expect(active).not.toContain("mcp__srv__drop");
+    expect(active).not.toContain("bridge_sibling");
+  });
+
+  it("narrows MCP tools that register after spawn", async () => {
+    setup({ mcpToolPatterns: ["mcp__srv__keep"] });
+    withExtensions({ "/ext/mcp.ts": [] });
+    const { session, listeners } = createSession("OK");
+    createAgentSession.mockResolvedValue({ session });
+
+    await runAgent(ctx, "Explore", "go", { pi });
+
+    const mcp = loaderExtensionsRef.current.extensions.find((e) => e.path === "/ext/mcp.ts")!;
+    mcp.tools.set("mcp__srv__keep", {});
+    mcp.tools.set("mcp__srv__drop", {});
+    for (const l of listeners) l({ type: "turn_end" });
+
+    expect(session.getActiveToolNames()).toContain("mcp__srv__keep");
+    expect(session.getActiveToolNames()).not.toContain("mcp__srv__drop");
+    await expect(
+      session.agent.beforeToolCall?.({ toolCall: { name: "mcp__srv__drop" } }),
+    ).resolves.toMatchObject({ block: true });
+    await expect(
+      session.agent.beforeToolCall?.({ toolCall: { name: "mcp__srv__keep" } }),
+    ).resolves.toBeUndefined();
+  });
+
+  it("disallowed_tools wins over a bridge and a named MCP tool", async () => {
+    setup({
+      mcpToolPatterns: ["mcp__srv__keep"],
+      extSelectors: ["ext:foo"],
+      disallowedTools: ["codemode", "mcp__srv__keep"],
+    });
+    withExtensions({ "/ext/foo.ts": ["foo_tool"], "/ext/mcp.ts": ["mcp__srv__keep", "codemode", "tool_search"] });
+
+    const active = await activeAfterRun();
+
+    expect(active).not.toContain("codemode");
+    expect(active).not.toContain("mcp__srv__keep");
+    expect(active).toContain("tool_search");
+  });
+
+  it("warns when mcp__ entries cannot be honoured because extensions are off", async () => {
+    vi.mocked(getConfig).mockReturnValueOnce(makeConfig({ extensions: false }));
+    vi.mocked(getAgentConfig).mockReturnValueOnce(
+      makeAgentConfig({ extensions: false, mcpToolPatterns: ["mcp__srv__keep"] }),
+    );
+    vi.mocked(getToolNamesForType).mockReturnValueOnce(["read"]);
+    const { session } = createSession("OK");
+    createAgentSession.mockResolvedValue({ session });
+    const onToolActivity = vi.fn();
+
+    await runAgent(ctx, "Explore", "go", { pi, onToolActivity });
+
+    const errors = onToolActivity.mock.calls
+      .map((c) => c[0]?.toolName)
+      .filter((n): n is string => typeof n === "string" && n.startsWith("tools-error:"));
+    expect(errors).toEqual([expect.stringContaining("mcp__srv__keep")]);
+  });
+});
+
 // ─── extensions: string[] as a loader-level extension filter ────────────
 // An array entry is a bare name (filters default-discovered extensions),
 // a path (loads that extension fresh), or "*" (keep all defaults).

@@ -173,6 +173,57 @@ describe("resumeAgent turn limit governance and tool restoration", () => {
     await resumePromise;
   });
 
+  // Deterministic offline substitute for the stdio MCP e2e: the same named /
+  // wildcard / server-level grants are applied to a live extension tool map.
+  describe("bare mcp__ patterns (offline scope substitute)", () => {
+    function scopedTools(patterns: string[]): string[] {
+      const { session } = createMockSession({
+        tools: [
+          "read", "codemode", "tool_search", "mcp__fixture__echo",
+          "mcp__fixture__secret", "mcp__other__echo", "plain_ext",
+        ],
+        activeTools: [],
+      });
+      const loader = {
+        getExtensions: () => ({
+          extensions: [{
+            path: "/ext/mcp.ts",
+            tools: new Map([
+              "codemode", "tool_search", "mcp__fixture__echo",
+              "mcp__fixture__secret", "mcp__other__echo", "plain_ext",
+            ].map((name) => [name, {}])),
+          }],
+        }),
+      };
+      installExtensionToolScope(session as any, {
+        loader: loader as any,
+        toolNames: ["read"],
+        disallowedSet: new Set(),
+        extNames: new Set(),
+        narrowing: new Map(),
+        mcpToolPatterns: patterns,
+        readmitToolNames: new Set(),
+        nestedCallGate: {},
+        isHardLimited: () => false,
+        hardLimitAllowedTools: () => [],
+      });
+      return session.getActiveToolNames();
+    }
+
+    it("admits only the exact MCP tool and its bridges", () => {
+      const active = scopedTools(["mcp__fixture__echo"]);
+      expect(active).toEqual(expect.arrayContaining(["read", "codemode", "tool_search", "mcp__fixture__echo", "plain_ext"]));
+      expect(active).not.toContain("mcp__fixture__secret");
+      expect(active).not.toContain("mcp__other__echo");
+    });
+
+    it("expands a server-level entry to every tool of that server", () => {
+      const active = scopedTools(["mcp__fixture__*"]);
+      expect(active).toEqual(expect.arrayContaining(["mcp__fixture__echo", "mcp__fixture__secret"]));
+      expect(active).not.toContain("mcp__other__echo");
+    });
+  });
+
   it("restores only in-scope tools when resuming a hard-limited session with installSessionToolController", async () => {
     const { session } = createMockSession({
       tools: ["read", "bash", "edit"],

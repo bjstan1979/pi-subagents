@@ -30,6 +30,7 @@ import { fileURLToPath } from "node:url";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { extensionCanonicalName, runAgent } from "../src/agent-runner.js";
 import { registerAgents } from "../src/agent-types.js";
+import { loadCustomAgents } from "../src/custom-agents.js";
 import type { AgentConfig } from "../src/types.js";
 import { registerFauxProvider } from "./helpers/pi-ai.js";
 
@@ -193,6 +194,37 @@ describe("agent-runner end-to-end (real pi-mono session + real extension)", () =
     });
     expect(active).toContain("exposure_off_by_default");
     expect(active).not.toContain("exposure_direct"); // narrowed away
+  });
+
+  // A Claude Code agent file, parsed by the real loader and run in a real session.
+  describe("Claude Code agent files", () => {
+    function parse(frontmatter: string): Partial<AgentConfig> {
+      mkdirSync(join(cwd, ".pi", "agents"), { recursive: true });
+      writeFileSync(join(cwd, ".pi", "agents", "cc.md"), `---\n${frontmatter}\n---\nPrompt.`);
+      const { builtinToolNames, disallowedTools, mcpToolPatterns } = loadCustomAgents(cwd).get("cc")!;
+      return { builtinToolNames, disallowedTools, mcpToolPatterns };
+    }
+
+    it("tools: Read, Grep, Glob, Bash, Edit, Write activates the matching pi built-ins", async () => {
+      const active = await activeToolsFor({ extensions: false, ...parse("tools: Read, Grep, Glob, Bash, Edit, Write") });
+      expect(active).toEqual(expect.arrayContaining(["read", "grep", "find", "bash", "edit", "write"]));
+      expect(active).not.toContain("ls");
+    });
+
+    it("disallowedTools: Write, Edit removes those built-ins", async () => {
+      const active = await activeToolsFor({ extensions: false, ...parse("disallowedTools: Write, Edit") });
+      expect(active).not.toContain("write");
+      expect(active).not.toContain("edit");
+      expect(active).toContain("read");
+    });
+
+    it("parses a bare mcp__ entry without activating unrelated default built-ins", async () => {
+      const parsed = parse("tools: Read, mcp__fixture__echo");
+      expect(parsed.mcpToolPatterns).toEqual(["mcp__fixture__echo"]);
+      const active = await activeToolsFor({ extensions: false, ...parsed });
+      expect(active).toContain("read");
+      expect(active).not.toContain("bash");
+    });
   });
 
   // pi's built-in MCP starts each stdio server in `.pi/mcp.json` when a session

@@ -217,6 +217,23 @@ export function parseExtSelectors(entries: string[]): {
   return { extNames, narrowing };
 }
 
+/** pi's MCP resource tools, which it counts as MCP tools alongside `mcp__<server>__<tool>`. */
+const MCP_RESOURCE_TOOL_NAMES = new Set(["list_mcp_resources", "list_mcp_resource_templates", "read_mcp_resource"]);
+
+/** The tools that reach `codemode`/`deferred` MCP tools: neither is declared to the model. */
+const MCP_BRIDGE_TOOL_NAMES = new Set(["codemode", "tool_search"]);
+
+const isMcpToolName = (name: string) => name.startsWith("mcp__") || MCP_RESOURCE_TOOL_NAMES.has(name);
+
+/** Whether `name` matches one of the `tools:` `mcp__` entries: an exact name or a `*` pattern. */
+function matchesToolPattern(name: string, patterns: readonly string[]): boolean {
+  return patterns.some((p) =>
+    p.includes("*")
+      ? new RegExp(`^${p.split("*").map((s) => s.replace(/[.+?^${}()|[\]\\]/g, "\\$&")).join(".*")}$`).test(name)
+      : p === name,
+  );
+}
+
 /**
  * Keep a subagent's tool scope correct as extensions register tools over time.
  *
@@ -1163,6 +1180,8 @@ export function installExtensionToolScope(
     disallowedSet: Set<string> | undefined;
     extNames: Set<string>;
     narrowing: Map<string, Set<string>>;
+    /** Bare `mcp__` entries from `tools:`; undefined leaves MCP tools to the rules above. */
+    mcpToolPatterns?: string[];
     /**
      * Injected `customTools` to keep active regardless of the built-in list.
      *
@@ -1178,7 +1197,7 @@ export function installExtensionToolScope(
     hardLimitAllowedTools?: () => string[];
   },
 ): void {
-  const { loader, toolNames, disallowedSet, extNames, narrowing, readmitToolNames, nestedCallGate } = ctx;
+  const { loader, toolNames, disallowedSet, extNames, narrowing, mcpToolPatterns, readmitToolNames, nestedCallGate } = ctx;
 
   const getIsHardLimited = (): boolean => {
     const controller = activeHardLimitControllers.get(session);
@@ -1218,6 +1237,20 @@ export function installExtensionToolScope(
         keep.add(name);
       }
     }
+    // Bare `mcp__` entries, as in pi's `--tools`: only matching MCP tools stay, from
+    // whichever extension serves them, even one the `ext:` opt-in left out — and so
+    // do the bridges that reach them.
+    if (mcpToolPatterns) {
+      for (const name of keep) {
+        if (isMcpToolName(name) && !matchesToolPattern(name, mcpToolPatterns)) keep.delete(name);
+      }
+      for (const extension of loader.getExtensions().extensions) {
+        for (const name of extension.tools.keys()) {
+          if (disallowedSet?.has(name)) continue;
+          if (MCP_BRIDGE_TOOL_NAMES.has(name) || matchesToolPattern(name, mcpToolPatterns)) keep.add(name);
+        }
+      }
+    }
     for (const name of EXCLUDED_TOOL_NAMES) keep.delete(name);
     // Injected tools are legitimately active for this agent — re-admit them so
     // the renarrow keeps them in the active set and beforeToolCall doesn't
@@ -1227,10 +1260,15 @@ export function installExtensionToolScope(
     return keep;
   };
 
-  // Names this agent selects explicitly: its built-ins, injected tools, and
-  // `ext:foo/bar` narrowings. pi activates a named tool even when it is
+  // Names this agent selects explicitly: its built-ins, injected tools, `ext:foo/bar`
+  // narrowings and exact `mcp__` entries. pi activates a named tool even when it is
   // `defaultActive: false`, as `--tools` does.
-  const named = new Set([...toolNames, ...readmitToolNames, ...[...narrowing.values()].flatMap((s) => [...s])]);
+  const named = new Set([
+    ...toolNames,
+    ...readmitToolNames,
+    ...[...narrowing.values()].flatMap((s) => [...s]),
+    ...(mcpToolPatterns ?? []).filter((p) => !p.includes("*")),
+  ]);
 
   // Activate what pi itself would: only tools declared to the model (`direct`/
   // `model-only` exposure), and of those only named ones or ones not opted out
@@ -1823,6 +1861,13 @@ export async function runAgent(
       }
     }
   }
+  // MCP tools come from extensions, so with none loaded these entries cannot match.
+  if (agentConfig?.mcpToolPatterns && noExtensions) {
+    options.onToolActivity?.({
+      type: "end",
+      toolName: `tools-error:${agentConfig.mcpToolPatterns.join(", ")} requested by agent "${type}" need extensions, but it loads none`,
+    });
+  }
 
   // A subagent spawns mid-task, so a bad `extensions:`/`ext:` entry warns rather
   // than aborts. Two distinct misconfigurations to catch:
@@ -1923,6 +1968,11 @@ export async function runAgent(
     ? [createStructuredOutputTool(options.structuredOutput, structuredCapture)]
     : [];
   const structuredToolNames = new Set(structuredTools.map(tool => tool.name));
+  // Exact bare mcp__ entries are explicit grants: name them in the static
+  // allowlist when extensions are off, and re-admit them to the live scope when
+  // extensions are on. Wildcards cannot be named before a server registers.
+  const mcpExactNames = (isolated ? [] : (agentConfig?.mcpToolPatterns ?? []))
+    .filter((p) => !p.includes("*") && !disallowedSet?.has(p) && !EXCLUDED_TOOL_NAMES.includes(p));
   // Re-admitted together at every gate below. Kept as one set so a new injected
   // tool cannot be added to some of the three gates and forgotten at the rest.
   //
@@ -1934,6 +1984,7 @@ export async function runAgent(
   const readmitToolNames = new Set([
     ...[...nestedToolNames].filter(name => !disallowedSet?.has(name)),
     ...structuredToolNames,
+    ...(noExtensions ? [] : mcpExactNames),
   ]);
 
   // ─── Tool scoping ───────────────────────────────────────────────────────
@@ -1980,6 +2031,10 @@ export async function runAgent(
       // satisfy it would make the request unsatisfiable by construction rather
       // than merely restricted.
       ...structuredToolNames,
+      // Extensions are off, so the warning above already reports that these
+      // names cannot be served; keeping them in the allowlist preserves the
+      // agent's declaration without admitting any undeclared tool.
+      ...mcpExactNames,
     ];
   } else {
     // Deny the orchestration tools EXCEPT the nested ones this agent opted into —
@@ -2109,6 +2164,7 @@ export async function runAgent(
       disallowedSet,
       extNames,
       narrowing,
+      mcpToolPatterns: isolated ? undefined : agentConfig?.mcpToolPatterns,
       readmitToolNames,
       nestedCallGate,
       isHardLimited: () => limitReached && Boolean(hardLimit),
