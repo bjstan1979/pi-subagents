@@ -27,6 +27,7 @@ import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
+import { createAgentSession, DefaultResourceLoader, SessionManager } from "@earendil-works/pi-coding-agent";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { extensionCanonicalName, runAgent } from "../src/agent-runner.js";
 import { registerAgents } from "../src/agent-types.js";
@@ -224,6 +225,128 @@ describe("agent-runner end-to-end (real pi-mono session + real extension)", () =
       const active = await activeToolsFor({ extensions: false, ...parsed });
       expect(active).toContain("read");
       expect(active).not.toContain("bash");
+    });
+  });
+
+  // A real pi session renders the parent's tagged sections; the append-mode child
+  // builds its own rendered prompt through the real loader and createAgentSession.
+  // The inherited parent prefix must not duplicate skills/cwd or carry extension
+  // sections that the child cannot edit (and skills:false must hide them).
+  describe("append mode inherits the parent prompt without its skills and cwd (#400)", () => {
+    let home: string;
+    let prevAgentDir: string | undefined;
+    let prevHome: string | undefined;
+
+    beforeEach(() => {
+      home = mkdtempSync(join(tmpdir(), "subagents-e2e-home-"));
+      prevAgentDir = process.env.PI_CODING_AGENT_DIR;
+      prevHome = process.env.HOME;
+      process.env.PI_CODING_AGENT_DIR = home;
+      process.env.HOME = home;
+      mkdirSync(join(home, "skills", "demo-skill"), { recursive: true });
+      writeFileSync(
+        join(home, "skills", "demo-skill", "SKILL.md"),
+        "---\nname: demo-skill\ndescription: A demo skill for the prompt test.\n---\n\nDemo.\n",
+      );
+      writeFileSync(join(cwd, "AGENTS.md"), "PROJECT RULE: say hi.\n");
+    });
+
+    afterEach(() => {
+      if (prevAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
+      else process.env.PI_CODING_AGENT_DIR = prevAgentDir;
+      if (prevHome === undefined) delete process.env.HOME;
+      else process.env.HOME = prevHome;
+      rmSync(home, { recursive: true, force: true });
+    });
+
+    /** A real parent prompt with the exact section markers pi 1.1.0 renders. */
+    async function realParentPrompt(): Promise<string> {
+      const loader = new DefaultResourceLoader({ cwd, agentDir: home, noExtensions: true });
+      await loader.reload();
+      const { session } = await createAgentSession({
+        cwd,
+        agentDir: home,
+        resourceLoader: loader,
+        sessionManager: SessionManager.inMemory(cwd),
+        model: faux.getModel(),
+      });
+      try {
+        return session.systemPrompt;
+      } finally {
+        session.dispose();
+      }
+    }
+
+    async function childPrompt(parentPrompt: string, skills: AgentConfig["skills"]): Promise<string> {
+      registerAgents(
+        new Map([
+          [
+            "twin",
+            {
+              name: "twin",
+              description: "twin",
+              builtinToolNames: BUILTINS,
+              extensions: false,
+              skills,
+              systemPrompt: "",
+              promptMode: "append",
+              inheritContext: false,
+              runInBackground: false,
+              isolated: false,
+            } as AgentConfig,
+          ],
+        ]),
+      );
+      const model = faux.getModel();
+      const modelRegistry: any = {
+        find: () => model,
+        getAll: () => [model],
+        getAvailable: () => [model],
+        hasConfiguredAuth: () => true,
+        isUsingOAuth: () => false,
+        registerProvider: () => {},
+        unregisterProvider: () => {},
+      };
+      const ctx: any = {
+        cwd,
+        getSystemPrompt: () => parentPrompt,
+        isProjectTrusted: () => true,
+        model,
+        modelRegistry,
+      };
+      let prompt = "";
+      try {
+        await runAgent(ctx, "twin", "go", {
+          pi: makePi(),
+          model,
+          onSessionCreated: (s) => { prompt = s.systemPrompt; },
+        });
+      } catch {
+        // Only the prompt built at construction matters; the faux turn may fail.
+      }
+      return prompt;
+    }
+
+    const count = (text: string, needle: string) => text.split(needle).length - 1;
+
+    it("keeps project context and lists skills/cwd once with skills:true", async () => {
+      const parent = await realParentPrompt();
+      expect(parent).toContain("PROJECT RULE: say hi.");
+      expect(count(parent, "<name>demo-skill</name>")).toBe(1);
+
+      const child = await childPrompt(parent, true);
+      expect(child).toContain("PROJECT RULE: say hi.");
+      expect(count(child, "<name>demo-skill</name>")).toBe(1);
+      expect(count(child, "<available_skills>")).toBe(1);
+      expect(count(child, "<cwd>")).toBe(1);
+      expect(child.startsWith(parent.slice(0, parent.indexOf("\n\n<skills>\n")))).toBe(true);
+    });
+
+    it("skills:false shows none of the parent's skills but keeps project context", async () => {
+      const child = await childPrompt(await realParentPrompt(), false);
+      expect(child).not.toContain("demo-skill");
+      expect(child).toContain("PROJECT RULE: say hi.");
+      expect(count(child, "<cwd>")).toBe(1);
     });
   });
 

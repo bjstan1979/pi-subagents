@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { renderRunningAgentStatus } from "../src/index.js";
 import type { WidgetMode } from "../src/types.js";
 import { type AgentActivity, AgentWidget, fgPreservingNestedStyles, formatCost, formatSessionTokens } from "../src/ui/agent-widget.js";
@@ -524,5 +524,31 @@ describe("AgentWidget overflow accounting", () => {
     agent.status = "completed";
     widget.markFinished(agent.id);
     expect(render()).toContain("resumed description");
+  });
+
+  it("dispose() cancels the 80ms render interval and clears the registered UI state", () => {
+    vi.useFakeTimers();
+    try {
+      const agent = record("live", "running");
+      const widget = new AgentWidget({ listAgents: () => [agent] } as any, new Map(), () => "all");
+      const setWidget = vi.fn();
+      const setStatus = vi.fn();
+      widget.setUICtx({ setStatus, setWidget, notify: vi.fn() } as any);
+
+      widget.ensureTimer();
+      const before = vi.getTimerCount();
+      expect(before).toBeGreaterThan(0);
+      widget.dispose();
+      expect(vi.getTimerCount()).toBe(before - 1);
+      expect(setWidget).toHaveBeenCalledWith("agents", undefined);
+      expect(setStatus).toHaveBeenCalledWith("subagents", undefined);
+
+      // A second dispose is harmless, and no interval is re-armed by late updates.
+      widget.dispose();
+      widget.update();
+      expect(vi.getTimerCount()).toBe(before - 1);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 });

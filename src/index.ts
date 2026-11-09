@@ -1207,8 +1207,18 @@ export default function (pi: ExtensionAPI) {
     for (const task of workflowTasks.values()) task.abortController.abort();
     workflowTasks.clear();
     manager.abortAll();
-    for (const timer of pendingNudges.values()) clearTimeout(timer);
-    pendingNudges.clear();
+    // Activation-owned UI and group state (#256): `session_shutdown` also runs for
+    // reload and session replacement, where the Node process survives, so a live
+    // widget render interval or a pending group-join timeout from this activation
+    // would outlive it and fire into the next session's UI and group state.
+    // The local 100ms batch debounce and 200ms held notifications are in the
+    // same boat: the deferred outbox port does not own them yet, so clear them
+    // here as well. `session_before_switch` deliberately keeps all of these:
+    // a vetoed switch continues this session, where the live UI and group state
+    // must survive.
+    clearNotificationTimers();
+    groupJoin.dispose();
+    widget.dispose();
     fleet.dispose();
     unsubHandoffKey?.();
     unsubHandoffKey = undefined;
@@ -1218,6 +1228,9 @@ export default function (pi: ExtensionAPI) {
     // pi awaits this handler, and the process exits right after — unawaited, those
     // handlers would never run. Internally bounded, so a hung one can't strand quit.
     await manager.dispose(pi);
+    // A child's shutdown can settle a completion into the notification path
+    // while the awaited dispose above is draining. Drop anything it armed.
+    clearNotificationTimers();
   });
 
   // Live widget: show running agents above editor.
@@ -1447,6 +1460,21 @@ export default function (pi: ExtensionAPI) {
         }
       }
     }
+  }
+
+  /**
+   * Drop every timer and buffering map owned by the local notification path.
+   * Unlike the upstream outbox, this activation keeps a 100ms smart-batch
+   * debounce and 200ms held nudges; both would otherwise outlive a reload and
+   * fire into the next session's UI. Safe to call more than once.
+   */
+  function clearNotificationTimers(): void {
+    if (batchFinalizeTimer) clearTimeout(batchFinalizeTimer);
+    batchFinalizeTimer = undefined;
+    for (const timer of pendingNudges.values()) clearTimeout(timer);
+    pendingNudges.clear();
+    pendingBatchCompletions.clear();
+    currentBatchAgents = [];
   }
 
   /**

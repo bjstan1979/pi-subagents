@@ -1,6 +1,6 @@
 import { beforeEach, describe, expect, it } from "vitest";
 import { getAgentConfig, registerAgents } from "../src/agent-types.js";
-import { buildAgentPrompt, MAX_MEMORY_BLOCK_CHARS } from "../src/prompts.js";
+import { buildAgentPrompt, inheritableParentPrompt, MAX_MEMORY_BLOCK_CHARS } from "../src/prompts.js";
 import type { AgentConfig, EnvInfo } from "../src/types.js";
 
 const env: EnvInfo = {
@@ -509,5 +509,41 @@ describe("buildAgentPrompt", () => {
       expect(prompt).toContain("<worktree_isolation>");
       expect(prompt.indexOf("<workflow_child>")).toBeGreaterThan(prompt.indexOf("<worktree_isolation>"));
     });
+  });
+});
+
+describe("inheritableParentPrompt", () => {
+  const preamble = "You are pi.\n\n<project_context>\nRules.\n</project_context>";
+  const skills = "<skills>\n<available_skills>\n  <skill><name>a</name></skill>\n</available_skills>\n</skills>";
+
+  it("drops the parent's skills, cwd and extension sections", () => {
+    const rendered = `${preamble}\n\n${skills}\n\n<cwd>\n/work\n</cwd>\n\n<extension_instructions>\nX\n</extension_instructions>`;
+    expect(inheritableParentPrompt(rendered, "/work")).toBe(preamble);
+  });
+
+  it("drops the cwd section when there are no skills (skills:false or a preload list)", () => {
+    expect(inheritableParentPrompt(`${preamble}\n\n<cwd>\n/work\n</cwd>`, "/work")).toBe(preamble);
+  });
+
+  it("matches the cwd as pi renders it on Windows", () => {
+    expect(inheritableParentPrompt(`${preamble}\n\n<cwd>\nC:/work\n</cwd>`, "C:\\work")).toBe(preamble);
+  });
+
+  it("uses the FINAL cwd marker so an earlier quoted one cannot truncate the preamble", () => {
+    const rendered = `${preamble}\n\n<example>\n\n<cwd>\n/work\n</cwd>\n</example>\n\n${skills}\n\n<cwd>\n/work\n</cwd>\n\n<tail>\nX\n</tail>`;
+    const inherited = inheritableParentPrompt(rendered, "/work");
+    expect(inherited).toContain("<example>");
+    expect(inherited).not.toContain("<tail>");
+    expect(inherited).not.toContain("<available_skills>");
+  });
+
+  it("returns a prompt without the cwd section unchanged, including a forced prompt", () => {
+    const forced = `${preamble}\n\n${skills}`;
+    expect(inheritableParentPrompt(forced, "/work")).toBe(forced);
+  });
+
+  it("does not strip sections when the parent cwd differs from the worktree cwd", () => {
+    const rendered = `${preamble}\n\n${skills}\n\n<cwd>\n/worktree\n</cwd>`;
+    expect(inheritableParentPrompt(rendered, "/parent")).toBe(rendered);
   });
 });

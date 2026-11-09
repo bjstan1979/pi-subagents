@@ -143,11 +143,18 @@ describe("GroupJoinManager", () => {
     mgr.registerGroup("g", ["a", "b"]);
 
     mgr.onAgentComplete(makeRecord("a")); // arms 30s timeout
+    expect(vi.getTimerCount()).toBe(1);
     mgr.dispose();
+    expect(vi.getTimerCount()).toBe(0);
 
     vi.advanceTimersByTime(60_000);
     expect(deliver).not.toHaveBeenCalled();
     expect(mgr.isGrouped("a")).toBe(false);
     expect(mgr.isGrouped("b")).toBe(false);
+
+    // A late completion after disposal is ungrouped, rather than re-arming a
+    // straggler timeout on an activation that has already shut down.
+    expect(mgr.onAgentComplete(makeRecord("b"))).toBe("pass");
+    expect(vi.getTimerCount()).toBe(0);
   });
 });

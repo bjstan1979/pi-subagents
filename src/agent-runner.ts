@@ -29,7 +29,7 @@ import { DEFAULT_AGENTS } from "./default-agents.js";
 import { detectEnv } from "./env.js";
 import { buildMemoryBlock, buildReadOnlyMemoryBlock } from "./memory.js";
 import { createNestedSubagentTools, getMaxSubagentDepth, type NestedAgentManager } from "./nested-tools.js";
-import { buildAgentPrompt, type PromptExtras } from "./prompts.js";
+import { buildAgentPrompt, inheritableParentPrompt, type PromptExtras } from "./prompts.js";
 import { promptWithResumeFallback, type ResumeModelOptions } from "./resume-model.js";
 import { preloadSkills } from "./skill-loader.js";
 import {
@@ -1668,8 +1668,11 @@ export async function runAgent(
 
   const env = await detectEnv(options.pi, effectiveCwd);
 
-  // Get parent system prompt for append-mode agents
-  const parentSystemPrompt = ctx.getSystemPrompt();
+  // Get parent system prompt for append-mode agents, without the sections the
+  // child session renders itself (skills, cwd, extension sections). Use the
+  // parent's cwd: that is where the parent's prompt was rendered, even when
+  // this child runs in a worktree or another cwd override.
+  const parentSystemPrompt = inheritableParentPrompt(ctx.getSystemPrompt(), ctx.cwd);
 
   // Build prompt extras (memory, skill preloading)
   const extras: PromptExtras = {};
@@ -1927,8 +1930,11 @@ export async function runAgent(
     ctx.model, ctx.modelRegistry, agentConfig?.model,
   );
 
-  // Resolve thinking level: explicit option > agent config > undefined (inherit)
-  const thinkingLevel = options.thinkingLevel ?? agentConfig?.thinking;
+  // Resolve thinking level: explicit option > agent config > parent session level.
+  // Without the parent step, an unset level falls through to pi's
+  // defaultThinkingLevel (e.g. "max") instead of matching the spawning session.
+  // Same idiom as mention-clone.ts. An absent level still leaves the option unset.
+  const thinkingLevel = options.thinkingLevel ?? agentConfig?.thinking ?? ctx.thinkingLevel;
 
   const disallowedSet = agentConfig?.disallowedTools
     ? new Set(agentConfig.disallowedTools)

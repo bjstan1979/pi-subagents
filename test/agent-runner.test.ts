@@ -106,6 +106,7 @@ vi.mock("../src/env.js", () => ({
 
 vi.mock("../src/prompts.js", () => ({
   buildAgentPrompt: vi.fn(() => "system prompt"),
+  inheritableParentPrompt: vi.fn((rendered: string) => rendered),
 }));
 
 vi.mock("../src/memory.js", () => ({
@@ -143,6 +144,7 @@ import {
   setGraceTurns,
   setRememberAgents,
 } from "../src/agent-runner.js";
+import { inheritableParentPrompt } from "../src/prompts.js";
 import { compileJsonSchema } from "../src/workflow/json-schema.js";
 
 /** The most recent session built by `createSession` — read by `lastToolsPassed()`. */
@@ -224,6 +226,7 @@ beforeEach(() => {
   settingsManagerGetSessionDir.mockReturnValue(undefined);
   settingsManagerCreate.mockClear();
   vi.mocked(createNestedSubagentTools).mockClear();
+  vi.mocked(inheritableParentPrompt).mockClear();
   loaderExtensionsRef.current = { extensions: [], errors: [], runtime: {} };
   lastSession = undefined;
 });
@@ -3212,5 +3215,90 @@ describe("resolveDefaultModel", () => {
 
   it("returns undefined when neither a config model nor a parent model exists", () => {
     expect(resolveDefaultModel(undefined, registry([haiku]), undefined)).toBeUndefined();
+  });
+});
+
+// The parent prompt is rendered with ctx.cwd, not the child's effective cwd.
+// A worktree or other cwd override must not change which tagged tail is cut.
+describe("agent-runner inheritable parent prompt (#400)", () => {
+  it("passes the parent prompt and PARENT cwd to inheritableParentPrompt", async () => {
+    const { session } = createSession("OK");
+    createAgentSession.mockResolvedValue({ session });
+    const parent = { ...ctx, cwd: "/parent", getSystemPrompt: vi.fn(() => "rendered parent prompt") };
+
+    await runAgent(parent, "Explore", "go", { pi, cwd: "/tmp/worktree" });
+
+    expect(inheritableParentPrompt).toHaveBeenCalledExactlyOnceWith("rendered parent prompt", "/parent");
+  });
+});
+
+// Thinking inheritance: explicit call > agent frontmatter > parent session.
+// With none of them, the option must stay absent so pi applies its own default.
+describe("agent-runner thinking level inheritance (#306)", () => {
+  it("inherits the parent session level when neither option nor agent config sets one", async () => {
+    const { session } = createSession("INHERITED");
+    createAgentSession.mockResolvedValue({ session });
+
+    await runAgent({ ...ctx, thinkingLevel: "medium" } as any, "Explore", "go", { pi });
+
+    expect(createAgentSession).toHaveBeenCalledWith(expect.objectContaining({
+      thinkingLevel: "medium",
+    }));
+  });
+
+  it("prefers an explicit option over the parent session level", async () => {
+    const { session } = createSession("EXPLICIT");
+    createAgentSession.mockResolvedValue({ session });
+
+    await runAgent({ ...ctx, thinkingLevel: "medium" } as any, "Explore", "go", {
+      pi,
+      thinkingLevel: "high",
+    });
+
+    expect(createAgentSession).toHaveBeenCalledWith(expect.objectContaining({
+      thinkingLevel: "high",
+    }));
+  });
+
+  it("prefers the agent config over the parent session level", async () => {
+    const { session } = createSession("CONFIG");
+    createAgentSession.mockResolvedValue({ session });
+    vi.mocked(getAgentConfig).mockReturnValueOnce(makeAgentConfig({ thinking: "low" }) as any);
+
+    await runAgent({ ...ctx, thinkingLevel: "medium" } as any, "Explore", "go", { pi });
+
+    expect(createAgentSession).toHaveBeenCalledWith(expect.objectContaining({
+      thinkingLevel: "low",
+    }));
+  });
+
+  it("omits thinkingLevel when nothing sets it, so pi applies its own default", async () => {
+    const { session } = createSession("DEFAULT");
+    createAgentSession.mockResolvedValue({ session });
+
+    await runAgent(ctx, "Explore", "go", { pi });
+
+    const opts = createAgentSession.mock.calls[0]?.[0] as Record<string, unknown>;
+    expect(opts).not.toHaveProperty("thinkingLevel");
+  });
+
+  it("reopening a stored session keeps its effective level with the conditional option", async () => {
+    const { session } = createSession("RESUMED");
+    session.thinkingLevel = "low";
+    createAgentSession.mockResolvedValue({ session });
+    settingsManagerGetSessionDir.mockReturnValue("/normal/pi/sessions");
+    vi.mocked(getAgentConfig).mockReturnValueOnce(makeAgentConfig());
+
+    await runAgent({ ...ctx, thinkingLevel: "medium" } as any, "Explore", "carry on", {
+      pi,
+      resumeSessionFile: "/sessions/explore.jsonl",
+      thinkingLevel: "high",
+    });
+
+    expect(sessionManagerOpen).toHaveBeenCalledWith("/sessions/explore.jsonl", "/normal/pi/sessions");
+    expect(createAgentSession).toHaveBeenCalledWith(expect.objectContaining({
+      thinkingLevel: "high",
+    }));
+    expect(session.thinkingLevel).toBe("low");
   });
 });
