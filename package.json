@@ -1,7 +1,7 @@
 {
   "name": "@tintinweb/pi-subagents",
-  "version": "0.21.0-local.1",
-  "description": "A pi extension that brings Claude Code-like sub-agents and workflow orchestration to pi \u2014 parallel execution, live widget, fleet view, custom agent types, mid-run steering, dynamic workflows, Claude Code compatibility, look and feel.",
+  "version": "0.21.0-local.9-role",
+  "description": "A pi extension that brings Claude Code-like sub-agents and workflow orchestration to pi — parallel execution, live widget, fleet view, custom agent types, mid-run steering, dynamic workflows, Claude Code compatibility, look and feel.",
   "author": "tintinweb",
   "license": "MIT",
   "repository": {
@@ -27,9 +27,16 @@
     "@earendil-works/pi-ai": "*",
     "@earendil-works/pi-coding-agent": "*",
     "@earendil-works/pi-tui": "*",
-    "typebox": "*"
+    "typebox": "*",
+    "@earendil-works/pi-agent-core": "*"
   },
   "dependencies": {
+    "@earendil-works/chord": "file:../pi-artifacts/tarballs/earendil-works-chord-1.4.0-7536e0cb3e31.tgz",
+    "@earendil-works/pi-codemode": "file:../pi-artifacts/tarballs/earendil-works-pi-codemode-1.4.0-db708d017a52.tgz",
+    "@earendil-works/pi-durable": "file:../pi-artifacts/tarballs/earendil-works-pi-durable-1.4.0-12d2325c7d4c.tgz",
+    "@earendil-works/pi-env": "file:../pi-artifacts/tarballs/earendil-works-pi-env-1.4.0-a2072f502bb1.tgz",
+    "@earendil-works/pi-mcp": "file:../pi-artifacts/tarballs/earendil-works-pi-mcp-1.4.0-f766999a61ac.tgz",
+    "@earendil-works/pi-telemetry": "file:../pi-artifacts/tarballs/earendil-works-pi-telemetry-1.4.0-30b21fa30c14.tgz",
     "croner": "^10.0.1",
     "nanoid": "^5.1.16"
   },
@@ -49,15 +56,16 @@
   },
   "devDependencies": {
     "@biomejs/biome": "^2.4.14",
-    "@earendil-works/pi-ai": "1.1.0",
-    "@earendil-works/pi-coding-agent": "1.1.0",
-    "@earendil-works/pi-tui": "1.1.0",
+    "@earendil-works/pi-ai": "file:../pi-artifacts/tarballs/earendil-works-pi-ai-1.4.0-3276167d0cfe.tgz",
+    "@earendil-works/pi-coding-agent": "file:../pi-artifacts/tarballs/earendil-works-pi-coding-agent-1.4.0-3a3c6bff913f.tgz",
+    "@earendil-works/pi-tui": "file:../pi-artifacts/tarballs/earendil-works-pi-tui-1.4.0-657422e5fa7e.tgz",
     "@sinclair/typebox": "^0.34.49",
     "@types/node": "^25.5.0",
     "@vitest/coverage-istanbul": "^4.1.10",
     "typebox": "^1.3.27",
     "typescript": "^6.0.0",
-    "vitest": "^4.0.18"
+    "vitest": "^4.0.18",
+    "@earendil-works/pi-agent-core": "file:../pi-artifacts/tarballs/earendil-works-pi-agent-core-1.4.0-3e8298f3848a.tgz"
   },
   "pi": {
     "extensions": [

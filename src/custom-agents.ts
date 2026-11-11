@@ -22,6 +22,7 @@ import type { AgentConfig, IsolationMode, MemoryScope, ThinkingLevel } from "./t
  * and a file must be able to override one.
  */
 const RESERVED_IN_TYPE = ":";
+const MANAGED_ROLES = new Set(["writer", "designer", "director", "business-analyst"]);
 
 /**
  * Scan for custom agent .md files from multiple locations.
@@ -102,7 +103,23 @@ function loadFromDir(dir: string, agents: Map<string, AgentConfig>, source: "pro
     // filename-derived one down with it.
     const name = declared || filenameType;
 
-    const { builtinToolNames, extSelectors, mcpToolPatterns } = parseToolsField(fm.tools);
+    // Candidate policy: only these managed identities are global-source locked.
+    // Refuse project shadowing visibly, regardless of project trust; all other
+    // project agents retain upstream discovery and priority.
+    if (MANAGED_ROLES.has(name)) {
+      if (source !== "global") {
+        warnIfNew(`Refusing project override ${path}: managed role "${name}" is locked to ${join(getAgentDir(), "agents")}; using controlled global replace role.`);
+        continue;
+      }
+      if (path !== join(getAgentDir(), "agents", `${name}.md`)) {
+        throw new Error(`Managed role ${name} must load from its exact global source ${join(getAgentDir(), "agents", `${name}.md`)}; refusing ${path}`);
+      }
+      if (fm.prompt_mode !== "replace" || !body.trim()) {
+        throw new Error(`Managed role ${name} at ${path} must explicitly use prompt_mode: replace and a nonempty identity`);
+      }
+    }
+
+    const { builtinToolNames, extSelectors } = parseToolsField(fm.tools);
 
     agents.set(name, {
       name,
@@ -114,13 +131,7 @@ function loadFromDir(dir: string, agents: Map<string, AgentConfig>, source: "pro
       description: str(fm.description) ?? name,
       builtinToolNames,
       extSelectors,
-      mcpToolPatterns,
-      // `disallowedTools` is Claude Code's spelling of the key. Each entry denies the tool
-      // with exactly that name, as in Claude Code, and the pi built-in it maps to, so an
-      // extension tool named `glob` stays denied rather than becoming `find`.
-      disallowedTools: csvListOptional(fm.disallowed_tools ?? fm.disallowedTools)?.flatMap(n => [
-        ...new Set([n, normalizeToolName(n)]),
-      ]),
+      disallowedTools: csvListOptional(fm.disallowed_tools),
       extensions: inheritField(fm.extensions ?? fm.inherit_extensions),
       excludeExtensions: csvListOptional(fm.exclude_extensions),
       skills: inheritField(fm.skills ?? fm.inherit_skills),
@@ -265,50 +276,22 @@ function csvList(val: unknown, defaults: string[]): string[] {
   return parseCsvField(val) ?? [];
 }
 
-/** Claude Code tool names whose pi built-in is named differently. Keys are lowercase. */
-const CLAUDE_CODE_TOOL_ALIASES: Record<string, string> = { glob: "find", multiedit: "edit" };
-
 /**
- * A tool name as pi spells it. Built-ins match case-insensitively, so Claude Code's
- * `Read` and `LS` work, and a Claude Code name with a differently named pi built-in
- * maps to it. Anything else comes back unchanged, so runAgent still warns about it.
+ * Partition the `tools:` CSV into the built-in tool allowlist and raw `ext:` selectors.
+ * `*` (and the case-insensitive alias `all`, for `tools: all`) expands to all
+ * built-ins; plain entries are built-in names; `ext:` entries are extension-tool
+ * selectors parsed later by the runner. omitted → all built-ins, no selectors.
+ * `tools:` present with only `ext:` entries → zero built-ins (use `*`).
  */
-function normalizeToolName(name: string): string {
-  const lower = name.toLowerCase();
-  return BUILTIN_TOOL_NAMES.find(b => b === lower) ?? CLAUDE_CODE_TOOL_ALIASES[lower] ?? name;
-}
-
-/**
- * Partition the `tools:` CSV into the built-in tool allowlist, raw `ext:` selectors
- * and bare `mcp__` entries. `*` (and the case-insensitive alias `all`, for
- * `tools: all`) expands to all built-ins; plain entries are built-in names, in pi's
- * or Claude Code's spelling; `ext:` entries are extension-tool selectors parsed
- * later by the runner; `mcp__<server>__<tool>` entries (exact or `*` patterns)
- * narrow MCP tools, as pi's `--tools` does. omitted → all built-ins, no selectors.
- * `tools:` present with only `ext:` or `mcp__` entries → zero built-ins (use `*`).
- */
-function parseToolsField(val: unknown): {
-  builtinToolNames: string[];
-  extSelectors: string[] | undefined;
-  mcpToolPatterns: string[] | undefined;
-} {
+function parseToolsField(val: unknown): { builtinToolNames: string[]; extSelectors: string[] | undefined } {
   const entries = csvList(val, BUILTIN_TOOL_NAMES);
   const isWildcard = (e: string) => e === "*" || e.toLowerCase() === "all";
-  const isMcp = (e: string) => e.startsWith("mcp__");
   const hasWildcard = entries.some(isWildcard);
-  const plain = [
-    ...new Set(entries.filter(e => !isWildcard(e) && !e.startsWith("ext:") && !isMcp(e)).map(normalizeToolName)),
-  ];
+  const plain = entries.filter(e => !isWildcard(e) && !e.startsWith("ext:"));
   const extEntries = entries.filter(e => e.startsWith("ext:"));
-  // A server-level `mcp__<server>` means every tool of that server, as in Claude Code.
-  const mcpEntries = entries.filter(isMcp).map(e => {
-    const server = e.slice("mcp__".length);
-    return server && !server.includes("__") ? `${e}__*` : e;
-  });
   return {
     builtinToolNames: hasWildcard ? [...new Set([...BUILTIN_TOOL_NAMES, ...plain])] : plain,
     extSelectors: extEntries.length > 0 ? extEntries : undefined,
-    mcpToolPatterns: mcpEntries.length > 0 ? mcpEntries : undefined,
   };
 }
 

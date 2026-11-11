@@ -19,10 +19,9 @@ import { realpathSync, statSync } from "node:fs";
 import { isAbsolute } from "node:path";
 import type { Model } from "@earendil-works/pi-ai";
 import type { AgentSession, ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
-import { parentIdentityFromCtx } from "./agent-record-entry.js";
 import { resumeAgent, runAgent, type ToolActivity } from "./agent-runner.js";
 import { getAgentConfig } from "./agent-types.js";
-import { type CompletionOutcomeV1, ManagedEndpoint, type ManagedInputV1, managedRegistry } from "./managed-continuation.js";
+import { type CompletionOutcomeV1, ManagedEndpoint, type ManagedInputV1, managedRegistry, refreshTerminalInput } from "./managed-continuation.js";
 import { assignHandle, handleBase } from "./mention.js";
 import { describeModel } from "./model-resolver.js";
 import { streamToOutputFile } from "./output-file.js";
@@ -307,8 +306,6 @@ interface SpawnOptions {
 }
 
 interface ResumeOptions {
-  /** Parent initiating a top-level live resume, for completion ownership. */
-  parentCtx?: ExtensionContext;
   model?: Model<any>;
   fallbackModel?: Model<any>;
   onModelChange?: (model: Model<any>, reason: "explicit" | "quota") => void;
@@ -385,26 +382,6 @@ export class AgentManager {
 
   private retained(id: string): boolean { return this.endpoints.get(id)?.retained ?? false; }
 
-  /**
-   * Whether a record belongs to the parent generation currently publishing
-   * completions. `clearCompleted(true)` bumps `parentGeneration` at every
-   * `session_start`, so a task from the previous
-   * parent that settles after `/new` is stale and must not append its result,
-   * checkpoint, lifecycle event or notification into the new parent's session.
-   */
-  isCurrentParent(record: AgentRecord): boolean {
-    return record.switchEpoch === this.parentGeneration;
-  }
-
-  private bindResultParent(record: AgentRecord, ctx: ExtensionContext): void {
-    record.switchEpoch = this.parentGeneration;
-    const parent = parentIdentityFromCtx(ctx);
-    record.parentEpoch = parent?.sessionFile ? parent.epoch : undefined;
-    record.parentSessionId = parent?.sessionFile ? parent.sessionId : undefined;
-    record.parentSessionFile = parent?.sessionFile || undefined;
-    record.parentCwd = parent?.sessionFile ? parent.cwd : undefined;
-  }
-
   private finishDeferredCleanup(id: string): void {
     const record = this.agents.get(id);
     if (this.retained(id) || record?.status === "running" || record?.status === "queued") return;
@@ -430,6 +407,7 @@ export class AgentManager {
       () => !this.activeExecutions.has(record.id) && !this.settling.has(record.id) && record.status !== "running" && record.status !== "queued",
       input => this.runContinuation(record, session, effective, input),
       () => this.finishDeferredCleanup(record.id),
+      () => record.executionEpoch,
     );
     this.endpoints.set(record.id, endpoint);
     managedRegistry().endpoints.set(session.sessionManager, endpoint);
@@ -438,11 +416,12 @@ export class AgentManager {
 
   private runContinuation(record: AgentRecord, session: AgentSession, effective: Readonly<{ maxTurns?: number; hardLimit: boolean }>, input: ManagedInputV1): Promise<CompletionOutcomeV1> {
     this.activeExecutions.add(record.id);
+    const previousStatus = record.status;
     record.status = "queued";
     record.isBackground = true;
     record.toolCallId = undefined;
     const epoch = (record.executionEpoch ?? 0) + 1;
-    record.executionEpoch = epoch;
+    const previousEpoch = record.executionEpoch;
     let complete!: (outcome: CompletionOutcomeV1) => void;
     const completion = new Promise<CompletionOutcomeV1>(resolve => { complete = resolve; });
     record.promise = completion.then(() => record.result ?? "");
@@ -452,7 +431,14 @@ export class AgentManager {
     };
     let started = false;
     const start = async () => {
-      if (this.endpoints.get(record.id)?.closed || record.executionEpoch !== epoch) { finish({ status: "cancelled", reason: "Endpoint closed" }); this.drainQueue(); return; }
+      if (this.endpoints.get(record.id)?.closed || record.executionEpoch !== previousEpoch) { finish({ status: "cancelled", reason: "Endpoint closed" }); this.drainQueue(); return; }
+      if (!refreshTerminalInput(input)) {
+        record.status = previousStatus;
+        finish({ status: "completed" });
+        this.drainQueue();
+        return;
+      }
+      record.executionEpoch = epoch;
       started = true;
       record.status = "running";
       record.startedAt = Date.now();
@@ -718,15 +704,6 @@ export class AgentManager {
       this.reopeningSessions.set(reopening, id);
       this.reopeningById.set(id, reopening);
     }
-    // Every spawn is stamped with the parent generation, so a task that
-    // settles after `session_start` bumped it can be
-    // rejected before it publishes anything into the NEW parent's session.
-    // Trust-stamp with the parent's canonical identity only when it is
-    // derivable. Without a persisted parent session file the other fields stay
-    // undefined: the settle record is still appended as legacy cross-extension
-    // history, but it can never answer a saved-result lookup. The canonical-
-    // path reservation above (and its release at settle) is untouched.
-    this.bindResultParent(record, ctx);
     this.agents.set(id, record);
     this.recordGenerations.set(record, this.parentGeneration);
     // After the insert, so `takenHandles()` already counts this record's own
@@ -1408,10 +1385,6 @@ export class AgentManager {
     // Starting a second run would trample record.abortController, desync the state
     // machine, and reject from session.prompt() with "Agent is already processing".
     if (record.status === "running" || record.status === "queued") return undefined;
-    if (options?.parentCtx && isTopLevelAgent(record)) {
-      this.bindResultParent(record, options.parentCtx);
-      this.recordGenerations.set(record, this.parentGeneration);
-    }
 
     // Background resume: settle asynchronously and notify on completion exactly
     // like a background spawn, returning immediately with the record still
@@ -1863,10 +1836,10 @@ export class AgentManager {
    * Pass skipUnconsumed=true to preserve records the LLM hasn't read yet
    * (resultConsumed=false) — they will be evicted by the 10-minute cleanup timer instead.
    */
-  clearCompleted(skipUnconsumed = false, advanceGeneration = true): void {
-    // A before-switch hook can be cancelled. Advance only after binding the
-    // new session; the existing pre-switch sweep still preserves #108 behavior.
-    if (advanceGeneration) this.parentGeneration++;
+  clearCompleted(skipUnconsumed = false): void {
+    // Both production callers are parent-session boundaries. Even records
+    // preserved as unconsumed must not publish a later cleanup into that parent.
+    this.parentGeneration++;
     for (const [id, record] of this.agents) {
       if (record.status === "running" || record.status === "queued") continue;
       if (this.retained(id)) continue;

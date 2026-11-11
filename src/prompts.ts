@@ -8,6 +8,8 @@ export const MAX_MEMORY_BLOCK_CHARS = 32_000;
 
 /** Extra sections to inject into the system prompt (memory, skills, etc.). */
 export interface PromptExtras {
+  /** Independent loader-selected append field, resolved after trust in parent session. */
+  resolvedCommonRules?: string;
   /** Persistent memory content to inject (first 200 lines of MEMORY.md + instructions). */
   memoryBlock?: string;
   /** Preloaded skill contents to inject. */
@@ -142,36 +144,14 @@ You have been invoked to handle a specific task autonomously.
 
 ${envBlock}`;
 
-  return activeAgentTag + replaceHeader + worktreeBlock + workflowBlock + "\n\n" + config.systemPrompt + extrasSuffix;
-}
-
-/**
- * The part of the parent's rendered system prompt that an append-mode child inherits.
- *
- * Pi renders a prompt as the preamble followed by tagged sections in a fixed order:
- * `tools`, `rules`, `docs` (default preamble only), `addendum`, `project_context`,
- * `skills`, `cwd`, then the sections extensions add during a turn. The child session
- * renders its own `skills` (from its `skills:` setting), its own `cwd` and its own
- * extension sections after the inherited text. Inheriting the parent's copies too
- * listed them twice, showed the parent's skills to children configured with
- * `skills: false` or a preload list, and left copies that section-editing extensions
- * in the child cannot reach. It also made the result depend on timing:
- * `getSystemPrompt()` includes the extension sections only while the parent's turn runs.
- *
- * Returns the text before the `skills` section, or before the `cwd` section when there
- * are no skills. A prompt without the `cwd` section (for example, a forced prompt) is
- * returned unchanged.
- *
- * @param rendered  The parent's `ctx.getSystemPrompt()`.
- * @param cwd  The cwd the parent's prompt was rendered with.
- */
-export function inheritableParentPrompt(rendered: string, cwd: string): string {
-  const cwdAt = rendered.lastIndexOf(`\n\n<cwd>\n${cwd.replace(/\\/g, "/")}\n</cwd>`);
-  if (cwdAt < 0) return rendered;
-  const head = rendered.slice(0, cwdAt);
-  if (!head.endsWith("\n</skills>")) return head;
-  const skillsAt = head.lastIndexOf("\n\n<skills>\n");
-  return skillsAt < 0 ? head : head.slice(0, skillsAt);
+  // Explicit independent rules source, never extracted from the parent's prompt.
+  // Only truly unset preserves upstream behavior; configured invalid sources fail closed.
+  if (["writer", "designer", "director", "business-analyst"].includes(config.name) && extras?.resolvedCommonRules === undefined) {
+    throw new Error(`Managed role ${config.name} requires a session-resolved common source`);
+  }
+  const commonRules = extras?.resolvedCommonRules ?? "";
+  const commonSection = commonRules ? `${commonRules}\n\n` : "";
+  return activeAgentTag + replaceHeader + worktreeBlock + workflowBlock + "\n\n" + commonSection + config.systemPrompt + extrasSuffix;
 }
 
 /** Fallback base prompt when parent system prompt is unavailable in append mode. */

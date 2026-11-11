@@ -223,26 +223,11 @@ ${input.systemPrompt}
 `;
 }
 
-/**
- * Rebuild the `tools:` CSV from the parts the loader split it into.
- *
- * `extSelectors` and `mcpToolPatterns` have to come back with the built-ins:
- * `parseToolsField` splits `tools: read, ext:mcp/github` into `["read"]` and
- * `["ext:mcp/github"]`, so writing only the first half hands the ejected copy a
- * *narrower* toolset than the file it came from.
- *
- * Zero built-ins with selectors present is not `none` — `none` means no tools at
- * all, while `ext:` entries alone mean "extension tools only".
- */
-function formatToolsField(
-  tools: string[] | undefined,
-  extSelectors?: string[],
-  mcpToolPatterns?: string[],
-): string {
-  const selectors = [...new Set([...(extSelectors ?? []), ...(mcpToolPatterns ?? [])])];
-  if (tools === undefined) return selectors.length > 0 ? ["*", ...selectors].join(", ") : "all";
-  if (tools.length === 0) return selectors.length > 0 ? selectors.join(", ") : "none";
-  return [...new Set([...tools, ...selectors])].join(", ");
+/** Render a built-in tool list as a `tools:` frontmatter value. */
+function formatToolsField(tools: string[] | undefined): string {
+  if (tools === undefined) return "all";
+  if (tools.length === 0) return "none";
+  return tools.join(", ");
 }
 
 /** Serialize an AgentConfig to a full .md file (frontmatter + system prompt) for eject. */
@@ -254,7 +239,7 @@ export function serializeAgentFile(cfg: AgentConfig): string {
   // Absent means "all built-ins"; an EMPTY list means explicitly zero. Writing
   // `all` for both would hand a deliberately tool-less agent the whole toolbox
   // the first time it is ejected.
-  fmFields.push(`tools: ${formatToolsField(cfg.builtinToolNames, cfg.extSelectors, cfg.mcpToolPatterns)}`);
+  fmFields.push(`tools: ${formatToolsField(cfg.builtinToolNames)}`);
   if (cfg.model) fmFields.push(`model: ${cfg.model}`);
   if (cfg.thinking) fmFields.push(`thinking: ${cfg.thinking}`);
   if (cfg.maxTurns) fmFields.push(`max_turns: ${cfg.maxTurns}`);
@@ -268,11 +253,7 @@ export function serializeAgentFile(cfg: AgentConfig): string {
   if (cfg.excludeExtensions?.length) fmFields.push(`exclude_extensions: ${cfg.excludeExtensions.join(", ")}`);
   if (cfg.skills === false) fmFields.push("skills: false");
   else if (Array.isArray(cfg.skills)) fmFields.push(`skills: ${cfg.skills.join(", ")}`);
-  if (cfg.disallowedTools?.length) {
-    // Claude Code aliases expand to both the original and pi's name when loaded;
-    // writing both back needlessly duplicates the denylist on every round trip.
-    fmFields.push(`disallowed_tools: ${[...new Set(cfg.disallowedTools)].join(", ")}`);
-  }
+  if (cfg.disallowedTools?.length) fmFields.push(`disallowed_tools: ${cfg.disallowedTools.join(", ")}`);
   if (cfg.inheritContext) fmFields.push("inherit_context: true");
   // Both cases, not just `true`: with `backgroundByDefault` on, omitting the
   // field means background, so `false` is the only way to pin an agent file to

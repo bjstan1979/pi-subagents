@@ -270,11 +270,11 @@ Group completions render each agent as a separate block. The LLM receives struct
 
 | Type | Tools | Model | Prompt Mode | Description |
 |------|-------|-------|-------------|-------------|
-| `general-purpose` | all 7 | inherit | `append` (parent twin) | Inherits the parent's rules, CLAUDE.md and project conventions; renders its own skills and cwd |
+| `general-purpose` | all 7 | inherit | `append` (parent twin) | Inherits the parent's full system prompt — same rules, CLAUDE.md, project conventions |
 | `Explore` | read, bash, grep, find, ls | haiku (falls back to inherit) | `replace` (standalone) | Fast codebase exploration (read-only) |
 | `Plan` | read, bash, grep, find, ls | inherit | `replace` (standalone) | Software architect for implementation planning (read-only) |
 
-The `general-purpose` agent is a **parent twin** — it receives the parent's preamble, rules and project context plus a sub-agent context bridge, so it follows the same rules the parent does. It stops before the parent's `<skills>`, `<cwd>` and extension sections: its own session renders those, so `skills: false` and preload lists stay authoritative and skills or cwd are not listed twice. Explore and Plan use standalone prompts tailored to their read-only roles.
+The `general-purpose` agent is a **parent twin** — it receives the parent's entire system prompt plus a sub-agent context bridge, so it follows the same rules the parent does. Explore and Plan use standalone prompts tailored to their read-only roles.
 
 Default agents can be **ejected** (`/agents` → select agent → Eject) to export them as `.md` files for customization, **overridden** by creating a `.md` file with the same name (e.g. `.pi/agents/general-purpose.md`), or **disabled** per-project with `enabled: false` frontmatter.
 
@@ -346,7 +346,7 @@ All fields are optional — sensible defaults for everything.
 | `output_transcript` | `true` (or `subagents.json` `outputTranscript`) | Write this subagent's `.output` transcript; when set, overrides the `subagents.json` `outputTranscript` default. Set `false` to write no transcript file or path. Governs only the transcript — independent of `persist_session`, `isolation: worktree`, and `memory:` |
 | `session_dir` | pi default | Optional session directory when `persist_session: true`; omitted uses pi's normal session location, and relative paths resolve from the agent cwd. A session outside the parent's session directory (this override, or `isolation: worktree`) is listed separately, so it shows as a root instead of nesting |
 | `allowed_subagents` | none | Opt in to scoped nested `Agent`, `get_subagent_result`, and `steer_subagent` tools. Omitted / empty / `none` / `false` = no nesting; `all` (or `"*"` / `true`) = any enabled agent; comma-separated list = only those agent types |
-| `prompt_mode` | `replace` | `replace`: body is the full system prompt (no AGENTS.md / CLAUDE.md inheritance). `append`: body appended to the inheritable part of the parent's prompt (agent acts as a "parent twin" — inherits parent's AGENTS.md / CLAUDE.md, but renders its own skills and cwd) |
+| `prompt_mode` | `replace` | `replace`: body is the full system prompt (no AGENTS.md / CLAUDE.md inheritance). `append`: body appended to parent's prompt (agent acts as a "parent twin" — inherits parent's AGENTS.md / CLAUDE.md) |
 | `inherit_context` | `false` | Fork parent conversation into agent |
 | `run_in_background` | — | Pin this agent to background (`true`) or foreground (`false`). Omit to follow `backgroundByDefault` |
 | `isolated` | `false` | Hermetic specialist mode: forces `extensions: false` + `skills: false` + drops `ext:` selectors. Only built-in tools. Distinct from `isolation: worktree` (filesystem) |
@@ -500,7 +500,7 @@ Concurrency is capped at `max(1, min(16, cpus - 2))` — the run's own limit, in
 
 ### `get_subagent_result`
 
-Check status and retrieve results from a background agent. Once the live record is gone (ten-minute eviction, reload, restart), it answers from the trust-stamped `subagents:record` entry on the current parent's active branch — by exact ID, or by a case-insensitive handle/alias whose newest completion wins. The saved read is repeatable: it never appends, consumes, caches, or reopens a child session, but cancels a matching pending completion notification. The identity stamp filters mismatched records; it is not authentication against another extension that can write session entries. Live records retain their existing cross-session behavior. Legacy entries without a v1 trust block, records from another parent session, and anything on an abandoned branch stay ordinary `Agent not found`; the result snapshot carries no session path and is never a resume source. If only a current-session checkpoint or tombstone remains, the tool explains how to use `Agent({ resume: "<exact-id>", prompt: "..." })`: resume starts another run, not a read-only result lookup, and still validates the saved session path.
+Check status and retrieve results from a background agent. If only a current-session checkpoint or tombstone remains, the tool explains how to use `Agent({ resume: "<exact-id>", prompt: "..." })`. It does not reopen the conversation automatically: resume starts another run, not a read-only result lookup, and still validates the saved session path.
 
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|
@@ -518,6 +518,14 @@ Send a steering message to a running agent. The message interrupts after the cur
 |-----------|------|----------|-------------|
 | `agent_id` | string | yes | Agent ID to steer |
 | `message` | string | yes | Message to inject into agent conversation |
+
+### `stop_subagent`
+
+Request that a running or queued top-level agent stop, using its ID or handle (`name` or type-derived handle). The response confirms the request, not completion of cleanup, and does not consume the result. A stopped queued agent does not produce a completion notification; use `get_subagent_result` to check it. Nested and workflow agents are not accessible through this tool; nested delegation retains its existing scoped tools.
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `agent_id` | string | yes | Agent ID or handle to stop |
 
 ## Commands
 

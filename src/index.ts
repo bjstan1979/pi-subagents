@@ -5,6 +5,7 @@
  *   Agent             — LLM-callable: spawn a sub-agent
  *   get_subagent_result  — LLM-callable: check background agent status/result
  *   steer_subagent       — LLM-callable: send a steering message to a running agent
+ *   stop_subagent        — LLM-callable: request an agent stop
  *
  * Commands:
  *   /agents                 — Interactive agent management menu
@@ -20,12 +21,12 @@ import { abortable } from "./abortable.js";
 import { hasAgentBadge, renderAgentName } from "./agent-color.js";
 import { buildNewAgentFile, disableInContent, enableInContent, isEmptyStub, locateAgentFile, personalAgentsDir, projectAgentsDir, serializeAgentFile } from "./agent-file-toggle.js";
 import { AgentManager, isTopLevelAgent } from "./agent-manager.js";
-import { AGENT_RECORD_ENTRY_TYPE, type AgentRecordEntryData, agentRecordEntryData, findTrustedAgentRecordEntry, formatSavedAgentRecord } from "./agent-record-entry.js";
 import { getAgentConversation, getDefaultMaxTurns, getGraceTurns, getRememberAgents, normalizeMaxTurns, resolveDefaultModel, resolveEffectiveMaxTurns, SUBAGENT_TOOL_NAMES, setDefaultMaxTurns, setGraceTurns, setRememberAgents, steerAgent } from "./agent-runner.js";
 import { BUILTIN_TOOL_NAMES, getAgentConfig, getAllTypes, getAvailableTypes, getConfig, getFallbackSubagent, isDefaultsDisabled, NO_FALLBACK, registerAgents, resolveSpawnType, resolveType, setDefaultsDisabled, setFallbackSubagent } from "./agent-types.js";
 import { findCheckpointById } from "./checkpoint-discovery.js";
 import { CHECKPOINT_ENTRY_TYPE, type CheckpointEntry, CheckpointIndex } from "./checkpoint-index.js";
 import { inChildSessionContext } from "./child-context.js";
+import { captureResolvedCommon, registerResolvedCommon } from "./resolved-common.js";
 import { type RpcHandle, registerRpcHandlers } from "./cross-extension-rpc.js";
 import { loadCustomAgents } from "./custom-agents.js";
 import { GroupJoinManager } from "./group-join.js";
@@ -313,6 +314,7 @@ export default function (pi: ExtensionAPI) {
   // would create another manager and leak handlers. Nested orchestration is
   // injected as scoped custom tools by the existing manager instead.
   if (inChildSessionContext()) return;
+  registerResolvedCommon(pi);
 
   // ---- Register custom notification renderer ----
   pi.registerMessageRenderer<NotificationDetails>(
@@ -597,7 +599,6 @@ export default function (pi: ExtensionAPI) {
   // into the NEW session afterwards; its checkpoint must not land there, or a
   // session that never spawned the agent replays it as its own on restart.
   let sessionStartedAt = 0;
-  let shuttingDown = false;
 
   // Background completion: route through group join or send individual nudge
   const manager = new AgentManager((record) => {
@@ -606,9 +607,6 @@ export default function (pi: ExtensionAPI) {
     // and dialog. Keep them out of top-level lifecycle, transcript,
     // notification, and UI channels.
     if (!isTopLevelAgent(record)) return;
-    // A run left over from a successfully replaced parent must not publish
-    // into this one. A cancellable before-switch event is not a boundary.
-    if (shuttingDown || !manager.isCurrentParent(record)) return;
 
     // Emit lifecycle event based on terminal status
     const isError = record.status === "error" || record.status === "stopped" || record.status === "aborted";
@@ -619,13 +617,14 @@ export default function (pi: ExtensionAPI) {
       pi.events.emit("subagents:completed", eventData);
     }
 
-    // Persist the final record. It is legacy cross-extension history when the
-    // parent has no persisted session file, and a trust-stamped, read-only
-    // saved-result snapshot when it does: get_subagent_result answers from the
-    // latter once the live record is gone. No session path is ever stored here;
-    // resuming a conversation stays with the checkpoint/tombstone machinery.
-    const saved: AgentRecordEntryData = agentRecordEntryData(record);
-    pi.appendEntry<AgentRecordEntryData>(AGENT_RECORD_ENTRY_TYPE, saved);
+    // Persist final record for cross-extension history reconstruction
+    pi.appendEntry("subagents:record", {
+      id: record.id, type: record.type, description: record.description,
+      status: record.status, result: record.result, error: record.error,
+      resultRevision: record.resultRevision ?? 1, consumedRevision: record.consumedRevision,
+      executionEpoch: record.executionEpoch ?? 1,
+      startedAt: record.startedAt, completedAt: record.completedAt,
+    });
 
     // Checkpoint: a settled agent with a persisted conversation stays resumable
     // by id/handle after eviction AND after this parent session itself is
@@ -863,7 +862,6 @@ export default function (pi: ExtensionAPI) {
       watchHandoffKey(ctx.ui);
     }
     manager.clearCompleted(true);
-    shuttingDown = false;
     sessionStartedAt = Date.now();
     // Replay this session's own checkpoint entries: agents settled before the
     // process exited stay resumable by id/handle after `--continue`/`--resume`.
@@ -1110,6 +1108,17 @@ export default function (pi: ExtensionAPI) {
       ?? (alias ? resolveHandleToType(alias, getAvailableTypes()) : undefined);
     if (!type) return { action: "continue" };
 
+    // Capture the exact loader-resolved rules before the first clone/direct dispatch.
+    // A missing/uncertain source is a handled error, never a model or direct fallback.
+    if (["writer", "designer", "director", "business-analyst"].includes(type)) {
+      try {
+        captureResolvedCommon(ctx);
+      } catch (err) {
+        ctx.ui.notify(`Could not start @${handleBase(type)}: ${err instanceof Error ? err.message : String(err)}`, "error");
+        return { action: "handled" };
+      }
+    }
+
     // Claude Code never starts the agent itself: `@agent-<type>` becomes an
     // attachment asking the main model to do it, and the model writes the
     // agent's prompt from the conversation rather than forwarding the typed
@@ -1180,16 +1189,13 @@ export default function (pi: ExtensionAPI) {
   });
 
   pi.on("session_before_switch", () => {
-    // Another extension may cancel this event. Preserve the historical sweep
-    // without advancing the publication generation until session_start.
-    manager.clearCompleted(true, false);
+    manager.clearCompleted(true);
     scheduler.stop();
   });
 
   // On shutdown, abort all agents immediately and clean up.
   // If the session is going down, there's nothing left to consume agent results.
   pi.on("session_shutdown", async () => {
-    shuttingDown = true;
     rpcHandle?.unsubSpawn();
     rpcHandle?.unsubStop();
     rpcHandle?.unsubPing();
@@ -1207,18 +1213,8 @@ export default function (pi: ExtensionAPI) {
     for (const task of workflowTasks.values()) task.abortController.abort();
     workflowTasks.clear();
     manager.abortAll();
-    // Activation-owned UI and group state (#256): `session_shutdown` also runs for
-    // reload and session replacement, where the Node process survives, so a live
-    // widget render interval or a pending group-join timeout from this activation
-    // would outlive it and fire into the next session's UI and group state.
-    // The local 100ms batch debounce and 200ms held notifications are in the
-    // same boat: the deferred outbox port does not own them yet, so clear them
-    // here as well. `session_before_switch` deliberately keeps all of these:
-    // a vetoed switch continues this session, where the live UI and group state
-    // must survive.
-    clearNotificationTimers();
-    groupJoin.dispose();
-    widget.dispose();
+    for (const timer of pendingNudges.values()) clearTimeout(timer);
+    pendingNudges.clear();
     fleet.dispose();
     unsubHandoffKey?.();
     unsubHandoffKey = undefined;
@@ -1228,9 +1224,6 @@ export default function (pi: ExtensionAPI) {
     // pi awaits this handler, and the process exits right after — unawaited, those
     // handlers would never run. Internally bounded, so a hung one can't strand quit.
     await manager.dispose(pi);
-    // A child's shutdown can settle a completion into the notification path
-    // while the awaited dispose above is draining. Drop anything it armed.
-    clearNotificationTimers();
   });
 
   // Live widget: show running agents above editor.
@@ -1463,21 +1456,6 @@ export default function (pi: ExtensionAPI) {
   }
 
   /**
-   * Drop every timer and buffering map owned by the local notification path.
-   * Unlike the upstream outbox, this activation keeps a 100ms smart-batch
-   * debounce and 200ms held nudges; both would otherwise outlive a reload and
-   * fire into the next session's UI. Safe to call more than once.
-   */
-  function clearNotificationTimers(): void {
-    if (batchFinalizeTimer) clearTimeout(batchFinalizeTimer);
-    batchFinalizeTimer = undefined;
-    for (const timer of pendingNudges.values()) clearTimeout(timer);
-    pendingNudges.clear();
-    pendingBatchCompletions.clear();
-    currentBatchAgents = [];
-  }
-
-  /**
    * Terminal results and completion notifications tell the model the agent is
    * resumable, by id. A run killed by its turn cap is the main case: the
    * conversation is on disk, and `resume` continues it instead of a fresh
@@ -1690,7 +1668,6 @@ export default function (pi: ExtensionAPI) {
     // the parent turn is interrupted (user Esc), while agents started with
     // run_in_background in that same turn keep going.
     const record = await manager.resume(id, prompt, undefined, {
-      parentCtx: ctx,
       isBackground: true,
       model: opts.model,
       fallbackModel: ctx.model,
@@ -1894,7 +1871,7 @@ If the target is already known, use a direct tool — \`read\` for a known path,
 - **Foreground vs background**: Pass \`run_in_background: false\` only when your very next action depends on the agent's result and nothing else could usefully happen while it runs — e.g., a research agent whose finding gates the edit you're about to make. Otherwise let it run in the background (the default) — this includes fire-and-forget work, independent investigations, and anything where the user might hand you something else in the meantime. Wanting the result "next" is not enough on its own.
 - **Don't race**: after launching a background agent, you know nothing about its results. Never fabricate or predict them in any format — not as prose, summary, or structured output. The completion notification arrives in a later turn; it is never something you write yourself. If the user asks before it lands, say the agent is still running — give status, not a guess.
 - Use resume with an agent ID to continue a previous agent's work. Omit subagent_type there — the agent keeps the type it was started with. A new (non-resume) Agent call starts a fresh agent with no memory of prior runs, so the prompt must be self-contained.
-- Use steer_subagent to send mid-run messages to a running background agent.
+- Use steer_subagent to send mid-run messages to a running background agent; use stop_subagent to request it stop.
 - Clearly tell the agent whether you expect it to write code or just to do research (search, file reads, etc.), since it is not aware of the user's intent.
 - If an agent's description says it should be used proactively, try to use it without the user having to ask for it first.
 - Use model to specify a different model (as "provider/modelId", or fuzzy e.g. "haiku", "sonnet").
@@ -2527,7 +2504,6 @@ Terse command-style prompts produce shallow, generic work.
         }
         const transcriptAnchor = existing.session.messages.length;
         const record = await manager.resume(existing.id, params.prompt, signal, {
-          parentCtx: ctx,
           onStarted: () => {
             if (existing.session && existing.outputFile) {
               existing.outputCleanup = streamToOutputFile(existing.session, existing.outputFile, existing.id, ctx.cwd, transcriptAnchor);
@@ -3331,35 +3307,9 @@ Terse command-style prompts produce shallow, generic work.
         }),
       ),
     }),
-    execute: async (_toolCallId, params, signal, _onUpdate, ctx) => {
-      const exactLive = manager.getRecord(params.agent_id);
-      const exactSaved = exactLive ? undefined : findTrustedAgentRecordEntry(ctx, params.agent_id);
-      const record = exactSaved ? undefined : resolveAgentRef(params.agent_id);
+    execute: async (_toolCallId, params, signal, _onUpdate, _ctx) => {
+      const record = resolveAgentRef(params.agent_id);
       if (!record || !isTopLevelAgent(record)) {
-        // Read-only saved-result fallback, ACTIVE BRANCH ONLY. Priority: a
-        // trusted exact-ID record; then a trusted handle/alias match whose
-        // newest completion wins; then a local tombstone/checkpoint name→ID.
-        // Cross-parent exact-ID checkpoint
-        // discovery stays a RESUME source in the Agent tool — it is deliberately
-        // NOT a result source here, and no file is opened by this read. A saved
-        // hit cancels the matching pending notification but never appends or
-        // consumes the saved result — reads are repeatable.
-        let savedHit = exactSaved ?? findTrustedAgentRecordEntry(ctx, params.agent_id, { matchNames: true });
-        if (!savedHit) {
-          const mention = manager.resolveMention(params.agent_id);
-          const byStoredId = mention?.kind === "tombstone"
-            ? mention.entry.id
-            : checkpointIndex.get(params.agent_id)?.id;
-          if (byStoredId) savedHit = findTrustedAgentRecordEntry(ctx, byStoredId);
-        }
-        if (savedHit) {
-          const key = `${savedHit.id}:${savedHit.resultRevision ?? 1}`;
-          cancelNudge(key);
-          if (pendingBatchCompletions.get(savedHit.id)?.resultRevision === (savedHit.resultRevision ?? 1)) {
-            pendingBatchCompletions.delete(savedHit.id);
-          }
-          return textResult(formatSavedAgentRecord(savedHit));
-        }
         const stored = !record ? lookupStoredEntry(params.agent_id) : undefined;
         if (stored) {
           return textResult(
@@ -3368,7 +3318,7 @@ Terse command-style prompts produce shallow, generic work.
             "Resume starts another run; it is not a read-only result lookup. The saved session will be validated before reopening.",
           );
         }
-        return textResult(`Agent not found: "${params.agent_id}". No live result or saved record is available in this session. Use the exact ID returned by Agent; do not invent an ID.`);
+        return textResult(`Agent not found: "${params.agent_id}". No live result or stored checkpoint is available in this session. Use the exact ID returned by Agent; do not invent an ID.`);
       }
 
       // Wait for completion if requested. Cancellation stops only this tool
@@ -3486,6 +3436,36 @@ Terse command-style prompts produce shallow, generic work.
       } catch (err) {
         return textResult(`Failed to steer agent: ${err instanceof Error ? err.message : String(err)}`);
       }
+    },
+  }));
+
+  // ---- stop_subagent tool ----
+
+  registerToolReportingUsage(defineTool({
+    name: SUBAGENT_TOOL_NAMES.STOP,
+    label: "Stop Agent",
+    description: "Request a running or queued top-level agent to stop. This does not wait for cleanup or consume its result. A stopped queued agent emits no completion notification; use get_subagent_result to check it.",
+    promptSnippet: "Request a background agent to stop",
+    parameters: Type.Object({
+      agent_id: Type.String({
+        description: "The agent ID or handle to stop (its name or type-derived handle).",
+      }),
+    }),
+    execute: async (_toolCallId, params, _signal, _onUpdate, _ctx) => {
+      const record = resolveAgentRef(params.agent_id);
+      if (!record || !isTopLevelAgent(record)) {
+        return textResult(`Agent not found: "${params.agent_id}". It may have been cleaned up.`);
+      }
+      if (record.status !== "running" && record.status !== "queued") {
+        return textResult(`Agent "${params.agent_id}" is not running or queued (status: ${record.status}). No stop requested.`);
+      }
+      const wasQueued = record.status === "queued";
+      if (!manager.abort(record.id)) {
+        return textResult(`Could not request stop for agent ${record.id}. It may have been cleaned up.`);
+      }
+      return textResult(wasQueued
+        ? `Stop requested for agent ${record.id}. A stopped queued agent emits no completion notification; use get_subagent_result to check its result.`
+        : `Stop requested for agent ${record.id}. Cleanup may still be in progress; its result has not been consumed.`);
     },
   }));
 
