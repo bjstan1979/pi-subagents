@@ -46,6 +46,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - **Exact-ID resume now works across parent sessions in the same project/session store.** A fresh parent can discover persisted checkpoints on other parent sessions' active branches instead of reporting `Agent not found`. Handles and aliases remain parent-session-local; discovery rejects other working directories, missing transcripts, and paths escaping the session store.
 
+- **An interval longer than ~24.8 days is refused at creation instead of being reported as scheduled.** `setTimeout`/`setInterval` accept at most 2^31-1 ms, so `schedule: "30d"` was persisted, then disabled on arming while `addJob` still returned an enabled job — the Agent tool answered "Scheduled … Next run: …" for a job that would never run. The ceiling is now checked while the job is built, before anything is written, and the error says to use a shorter interval or a cron expression. A one-shot that far out is unaffected (it is armed in clamped hops), and a job already on disk with an over-long interval is still disabled on load rather than armed.
+
+- **`@handle` mentions are TUI-only, and the README now says so.** The input hook falls through for every non-TUI mode (`print`, `json`, `rpc`), so `pi -p '@plan the migration'` hands the line to the main model as ordinary prose instead of cloning and spawning — claiming a turn outside the TUI answered with silence and spawned into a session that had already shut down. Headless callers reach subagents with an explicit `Agent` tool call, which no mode intercepts. Documentation-only; behavior is unchanged.
+
 ### Local
 
 - Local opt-in `hard_limit` turn ceilings; defaults remain soft.

@@ -100,10 +100,23 @@ export class SubagentScheduler {
 
   /**
    * Build a `ScheduledSubagent` from user input. Validates the schedule
-   * format and tags `scheduleType`. Throws on invalid input.
+   * format and tags `scheduleType`. Throws on invalid input, and on an interval
+   * longer than the timer ceiling.
    */
   buildJob(input: NewJobInput): ScheduledSubagent {
     const detected = SubagentScheduler.detectSchedule(input.schedule);
+    // Refuse an over-long interval here, before anything is persisted: an
+    // armed one would spin at Node's clamped 1 ms, and the only place that
+    // could catch it afterwards disables the job — so `addJob` would report a
+    // created, enabled job that never runs. A one-shot this far out is fine:
+    // scheduleJob chains it in clamped hops. Jobs already on disk keep going
+    // through that disable path, which stays as the safety net.
+    if (detected.type === "interval" && detected.intervalMs && detected.intervalMs > MAX_TIMER_DELAY_MS) {
+      throw new Error(
+        `Interval "${detected.normalized}" (${detected.intervalMs} ms) exceeds the longest supported interval ` +
+        `(${MAX_TIMER_DELAY_MS} ms, ~24.8 days). Use a shorter interval, or a 6-field cron expression for a longer cadence.`
+      );
+    }
     return {
       id: nanoid(10),
       name: input.name,

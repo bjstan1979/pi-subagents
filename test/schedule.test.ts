@@ -6,11 +6,13 @@
  *   - Job lifecycle (add / update / remove / cleanup)
  *   - Fire path (interval, one-shot) with mocked AgentManager + fake timers
  *   - Past-timestamp rejection
+ *   - Long delays: chained one-shots, and intervals past the timer ceiling
+ *     refused at creation
  *   - One-shot auto-disable
  *   - Concurrency-bypass option flows through to manager.spawn
  */
 
-import { mkdtempSync, rmSync } from "node:fs";
+import { existsSync, mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -291,16 +293,82 @@ describe("SubagentScheduler — long delays", () => {
     expect(scheduler.list().find(j => j.id === job.id)?.enabled).toBe(false);
   });
 
-  it("refuses an interval longer than the timer ceiling instead of spinning at 1 ms", () => {
-    const job = scheduler.addJob({
+  // A 30-day interval (2_592_000_000 ms) is past Node's 2^31-1 ceiling. The
+  // scheduler used to accept it, persist it, then disable it on arming while
+  // addJob still returned an enabled job — the Agent tool reported a scheduled
+  // run that would never happen. It must be refused before anything is stored.
+  it("rejects an interval beyond the timer ceiling before persisting anything", () => {
+    expect(() => scheduler.addJob({
       name: "monthly", description: "x", schedule: "30d",
       subagent_type: "general-purpose", prompt: "x",
+    })).toThrow(/exceeds the longest supported interval/);
+
+    // Nothing was created, nothing reached disk, and no "added" was announced.
+    expect(scheduler.list()).toEqual([]);
+    expect(existsSync(join(tmp, "s.json"))).toBe(false);
+    expect(pi.events.emit).not.toHaveBeenCalledWith(
+      "subagents:scheduled",
+      expect.objectContaining({ type: "added" }),
+    );
+  });
+
+  it("accepts the longest representable interval and refuses one second past it", () => {
+    // 2_147_483 s → 2_147_483_000 ms, just under 2^31-1: still armable.
+    const edge = scheduler.addJob({
+      name: "edge", description: "x", schedule: "2147483s",
+      subagent_type: "general-purpose", prompt: "x",
     });
-    const refused = scheduler.list().find(j => j.id === job.id);
-    expect(refused?.enabled).toBe(false);
-    expect(refused?.lastStatus).toBe("error");
+    expect(edge.scheduleType).toBe("interval");
+    expect(edge.intervalMs).toBe(2_147_483_000);
+    expect(scheduler.list().find(j => j.id === edge.id)?.enabled).toBe(true);
+
+    // 2_147_484 s → 2_147_484_000 ms, one second past the ceiling.
+    expect(() => scheduler.addJob({
+      name: "past-edge", description: "x", schedule: "2147484s",
+      subagent_type: "general-purpose", prompt: "x",
+    })).toThrow(/exceeds the longest supported interval/);
+    expect(scheduler.list().map(j => j.name)).toEqual(["edge"]);
+  });
+
+  // The refusal is scoped to intervals: a one-shot this far out is chained in
+  // clamped hops by scheduleJob, so `+30d` stays valid and must not fire early.
+  it("still accepts a +30d one-shot and does not fire it early", () => {
+    vi.useFakeTimers();
+    const job = scheduler.addJob({
+      name: "far-once", description: "x", schedule: "+30d",
+      subagent_type: "general-purpose", prompt: "x",
+    });
+    expect(job.scheduleType).toBe("once");
+    vi.advanceTimersByTime(2_000);
+    expect(manager.spawn).not.toHaveBeenCalled();
+    expect(scheduler.list().find(j => j.id === job.id)?.enabled).toBe(true);
+  });
+
+  // Jobs already on disk (written by an older version) can still carry an
+  // over-long interval. Arming one must disable it rather than spin at the
+  // clamped 1 ms — the safety net the create-time refusal does not replace.
+  it("disables an already-persisted over-long interval on reload", () => {
+    store.add({
+      id: "reload-interval",
+      name: "reload-interval",
+      description: "reload-interval",
+      schedule: "30d",
+      scheduleType: "interval",
+      intervalMs: 2_592_000_000,
+      subagent_type: "general-purpose",
+      prompt: "x",
+      enabled: true,
+      createdAt: new Date().toISOString(),
+      runCount: 0,
+    });
+    scheduler.stop();
+    scheduler.start(pi, ctx, manager, store);
+
+    const reloaded = scheduler.list().find(j => j.id === "reload-interval");
+    expect(reloaded?.enabled).toBe(false);
+    expect(reloaded?.lastStatus).toBe("error");
     expect(pi.events.emit).toHaveBeenCalledWith("subagents:scheduled", expect.objectContaining({
-      type: "error", jobId: job.id, error: expect.stringMatching(/longest supported timer/),
+      type: "error", jobId: "reload-interval", error: expect.stringMatching(/longest supported timer/),
     }));
   });
 });
