@@ -704,9 +704,12 @@ describe("letting a clone of the conversation start the agent", () => {
     expect(runMentionClone).not.toHaveBeenCalled();
   });
 
-  it("works headlessly, where the visible-turn version never could", async () => {
-    // The TUI-only guard exists because a claimed turn answers `pi -p` with
-    // silence. The clone starts a real agent whose completion still reports.
+  it("falls through to the main model headlessly instead of starting a silent clone", async () => {
+    // Claiming the turn (`handled`) returns from prompt() before any turn
+    // starts, so `pi -p "@explore …"` printed nothing: print mode has no TUI to
+    // notify, and the clone below is detached (it awaits its own model turn)
+    // while shutdown aborts the agent it would spawn. Every non-TUI mode now
+    // falls through, so the mention reads as ordinary prose.
     const { lifecycle } = boot();
     cloneReturns({ spawned: true });
 
@@ -716,8 +719,8 @@ describe("letting a clone of the conversation start the agent", () => {
     );
     await flush();
 
-    expect(result).toEqual({ action: "handled" });
-    expect(runMentionClone).toHaveBeenCalled();
+    expect(result).toEqual({ action: "continue" });
+    expect(runMentionClone).not.toHaveBeenCalled();
   });
 
   it("leaves a running agent alone headlessly rather than starting a rival", async () => {

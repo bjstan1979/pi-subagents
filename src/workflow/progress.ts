@@ -320,17 +320,21 @@ export function buildPhaseGroups(
  * `agentCount` is the number the runtime has *scheduled*, which can exceed the
  * number that has emitted an entry — a fan-out reports its size before its
  * agents start, so the total does not visibly climb as they trickle in.
+ *
+ * Counts come from `collapse()`, not from the raw log: the progress log is
+ * append-only with last-write-wins semantics, so one agent emits `queued`,
+ * `started`, and a terminal row under the same `index`. Iterating rows instead
+ * of agents multiplied `seen` by the number of emits (a 4-agent run reported
+ * `4/12`) and inflated the card's size warning the same way.
  */
 export function stats(progress: readonly WorkflowEntry[], agentCount = 0): WorkflowStats {
-  let seen = 0;
+  const agents = collapse(progress).agents;
   let done = 0;
   let failed = 0;
   let started = 0;
   let anyLive = false;
 
-  for (const entry of progress) {
-    if (entry.type !== "workflow_agent") continue;
-    seen++;
+  for (const entry of agents) {
     if (entry.state === "done") {
       done++;
       started++;
@@ -344,18 +348,19 @@ export function stats(progress: readonly WorkflowEntry[], agentCount = 0): Workf
     }
   }
 
-  const total = Math.max(agentCount, seen);
+  const total = Math.max(agentCount, agents.length);
   return {
     done,
     failedCount: failed,
     running: anyLive,
     total,
     started,
-    // `!anyLive` is implied by the count test — `total >= seen`, and `seen` also
-    // counts live entries, so `done + failed >= total` can only hold when none
-    // are live. Kept for parity with Claude Code and as a guard should `total`
-    // ever stop deriving from `seen`; no test can reach it as written.
-    complete: !anyLive && seen > 0 && done + failed >= total,
+    // `!anyLive` is implied by the count test — `total >= agents.length`, and
+    // every collapsed agent is either terminal or live, so `done + failed >=
+    // total` can only hold when none are live. Kept for parity with Claude
+    // Code and as a guard should `total` ever stop deriving from the collapsed
+    // length; no test can reach it as written.
+    complete: !anyLive && agents.length > 0 && done + failed >= total,
   };
 }
 

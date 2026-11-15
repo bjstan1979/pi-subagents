@@ -314,6 +314,30 @@ describe("stats", () => {
     ]);
     expect(result).toMatchObject({ done: 0, total: 0, started: 0 });
   });
+
+  it("counts one agent once even though the log re-emits it per state change", () => {
+    // The progress log is append-only with last-write-wins semantics: a happy
+    // path emits queued, started, and done under the same index. Counting rows
+    // instead of agents reported `3/9` for a finished 3-agent run.
+    const log: WorkflowEntry[] = [
+      ...Array.from({ length: 3 }, (_, index) => agentEntry({ index, state: "start", queuedAt: 5 })),
+      ...Array.from({ length: 3 }, (_, index) => agentEntry({ index, state: "start", queuedAt: 5, startedAt: 6 })),
+      ...Array.from({ length: 3 }, (_, index) => agentEntry({ index, state: "done", queuedAt: 5, startedAt: 6 })),
+    ];
+    const result = stats(log, 3);
+    expect(result).toMatchObject({ done: 3, total: 3, started: 3, running: false, complete: true });
+  });
+
+  it("keeps a retried agent to a single slot with its latest state", () => {
+    const log: WorkflowEntry[] = [
+      agentEntry({ index: 0, state: "start", queuedAt: 5 }),
+      agentEntry({ index: 0, state: "start", queuedAt: 5, startedAt: 6 }),
+      agentEntry({ index: 0, state: "error" }),
+      agentEntry({ index: 0, state: "start", queuedAt: 9, startedAt: 10, attempt: 2 }),
+      agentEntry({ index: 0, state: "done", queuedAt: 9, startedAt: 10, attempt: 2 }),
+    ];
+    expect(stats(log)).toMatchObject({ done: 1, failedCount: 0, total: 1, started: 1 });
+  });
 });
 
 describe("elapsedMs", () => {

@@ -25,6 +25,15 @@ import { resolveModel } from "./model-resolver.js";
 import type { ScheduleStore } from "./schedule-store.js";
 import type { IsolationMode, ScheduledSubagent, SubagentType, ThinkingLevel } from "./types.js";
 
+/**
+ * Longest delay `setTimeout`/`setInterval` accepts (2^31-1 ms, ~24.85 days).
+ * Node clamps anything above it to 1 ms, so a one-shot scheduled further out
+ * would fire immediately, spawn its agent at once, and then disable itself —
+ * silently the opposite of what was asked. Pass the value through a chained
+ * timeout instead of overflowing, and refuse to arm an interval above it.
+ */
+const MAX_TIMER_DELAY_MS = 2 ** 31 - 1;
+
 /** Event emitted on `pi.events` for cross-extension consumers. */
 export type ScheduleChangeEvent =
   | { type: "added"; job: ScheduledSubagent }
@@ -173,20 +182,36 @@ export class SubagentScheduler {
     if (!store) return;
     try {
       if (job.scheduleType === "interval" && job.intervalMs) {
+        if (job.intervalMs > MAX_TIMER_DELAY_MS) {
+          // An interval this long cannot be represented by setInterval; arming it
+          // would spin at 1 ms. Disable and report instead of firing continuously.
+          store.update(job.id, { enabled: false, lastStatus: "error" });
+          this.emit({ type: "error", jobId: job.id, error: `Interval ${job.schedule} exceeds the longest supported timer (${MAX_TIMER_DELAY_MS} ms)` });
+          return;
+        }
         const t = setInterval(() => this.executeJob(job.id), job.intervalMs);
         this.intervals.set(job.id, t);
       } else if (job.scheduleType === "once") {
         const target = new Date(job.schedule).getTime();
         const delay = target - Date.now();
         if (delay > 0) {
-          const t = setTimeout(() => {
-            this.executeJob(job.id);
-            // Auto-disable one-shots after they fire (mirrors pi-cron-schedule)
-            store.update(job.id, { enabled: false });
-            const updated = store.get(job.id);
-            if (updated) this.emit({ type: "updated", job: updated });
-          }, delay);
-          this.intervals.set(job.id, t);
+          // Arm the long part in clamped hops rather than handing Node an
+          // overflowing delay. Re-reads the target so a clock change cannot
+          // fire early, and is dropped silently if the job was unscheduled.
+          const arm = (remaining: number) => {
+            const t = setTimeout(() => {
+              const left = target - Date.now();
+              if (left > 0) { arm(left); return; }
+              this.intervals.delete(job.id);
+              this.executeJob(job.id);
+              // Auto-disable one-shots after they fire (mirrors pi-cron-schedule)
+              store.update(job.id, { enabled: false });
+              const updated = store.get(job.id);
+              if (updated) this.emit({ type: "updated", job: updated });
+            }, Math.min(remaining, MAX_TIMER_DELAY_MS));
+            this.intervals.set(job.id, t);
+          };
+          arm(delay);
         } else {
           // Past timestamp — disable, mark error, never fire
           store.update(job.id, { enabled: false, lastStatus: "error" });

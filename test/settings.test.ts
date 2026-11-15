@@ -317,8 +317,13 @@ describe("settings persistence", () => {
       expect(loadSettings(projectDir)).toEqual({});
     });
 
-    it("drops graceTurns < 1", () => {
+    it("keeps graceTurns 0 and drops negative values", () => {
+      // 0 means "abort at exactly maxTurns"; the menu advertises "Grace turns
+      // (0+)" and setGraceTurns clamps to 0, so requiring 1 here silently
+      // reverted the setting to the default 5 after every restart.
       writeProject({ graceTurns: 0 });
+      expect(loadSettings(projectDir)).toEqual({ graceTurns: 0 });
+      writeProject({ graceTurns: -1 });
       expect(loadSettings(projectDir)).toEqual({});
     });
 

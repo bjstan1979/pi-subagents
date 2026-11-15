@@ -74,9 +74,14 @@ export class GroupJoinManager {
     // First completion in this batch — start timeout
     if (!group.timeoutHandle) {
       const timeout = group.isStraggler ? STRAGGLER_TIMEOUT : this.groupTimeout;
-      group.timeoutHandle = setTimeout(() => {
+      const handle = setTimeout(() => {
         this.onTimeout(group);
       }, timeout);
+      // A pending join timer must never hold the process open by itself: print
+      // mode returns from prompt() without process.exit, so an unref'd timer is
+      // the difference between exiting now and up to 30 s later.
+      handle.unref?.();
+      group.timeoutHandle = handle;
     }
 
     return 'held';

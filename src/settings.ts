@@ -381,9 +381,14 @@ function sanitize(raw: unknown): SubagentsSettings {
   }
   if (
     Number.isInteger(r.graceTurns) &&
-    (r.graceTurns as number) >= 1 &&
+    (r.graceTurns as number) >= 0 &&
     (r.graceTurns as number) <= GRACE_TURNS_CEILING
   ) {
+    // Floor 0, like maxConcurrentForeground and maxSubagentDepth: 0 is a
+    // meaningful configuration (abort at exactly maxTurns instead of
+    // maxTurns+5), the settings menu advertises "Grace turns (0+)", and
+    // `setGraceTurns` already clamps to 0. Requiring 1 here silently reverted
+    // the user's choice to the default 5 on every restart.
     out.graceTurns = r.graceTurns as number;
   }
   if (

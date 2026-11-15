@@ -2351,6 +2351,22 @@ export async function resumeAgent(
     loopState.pendingCalls.clear();
     loopState.blockedCalls.clear();
     loopState.blockedToolKeys.clear();
+    // A resume is a new user-initiated run: the session idled, the user came
+    // back (often hours later, often after editing files outside the agent),
+    // and the resume prompt usually asks the agent to look again. The loop
+    // guard's premise — "identical read-only call with no intervening
+    // modifications" — is false across that boundary, so the read cache and
+    // the turn counters that qualify it reset here. Only an agent's own write
+    // invalidated a key before, so an external change never did, and the
+    // resumed run was blocked with "refer to the existing tool result" for the
+    // exact files it was resumed to re-read. Within-run duplicates still block:
+    // the state is re-populated from this run's own calls.
+    loopState.readOnlyCalls.clear();
+    loopState.fileMutations.clear();
+    loopState.directoryMutations.clear();
+    loopState.lastWorkspaceMutationTurn = -1;
+    loopState.lastMutatingTurn = -1;
+    loopState.currentTurn = 0;
   }
   const unsubEvents = session.subscribe((event: AgentSessionEvent) => {
     if (event.type === "turn_end") {

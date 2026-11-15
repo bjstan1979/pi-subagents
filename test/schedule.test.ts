@@ -228,6 +228,83 @@ describe("SubagentScheduler — lifecycle", () => {
   });
 });
 
+describe("SubagentScheduler — long delays", () => {
+  let tmp: string;
+  let store: ScheduleStore;
+  let scheduler: SubagentScheduler;
+  let manager: any;
+  let pi: any;
+  let ctx: any;
+
+  beforeEach(() => {
+    tmp = mkdtempSync(join(tmpdir(), "scheduler-long-test-"));
+    store = new ScheduleStore(join(tmp, "s.json"));
+    scheduler = new SubagentScheduler();
+    manager = makeMockManager();
+    pi = makeMockPi();
+    ctx = makeMockCtx();
+    scheduler.start(pi, ctx, manager, store);
+  });
+
+  afterEach(() => {
+    scheduler.stop();
+    vi.useRealTimers();
+    rmSync(tmp, { recursive: true, force: true });
+  });
+
+  // Node clamps a delay above 2^31-1 ms to 1 ms, so handing it a 30-day delay
+  // fired the one-shot immediately and then disabled it — the exact opposite of
+  // the request. The delay must be chained, never passed through.
+  it("does not fire a one-shot scheduled beyond the timer ceiling", () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2026-11-15T00:00:00Z"));
+    const job = scheduler.addJob({
+      name: "far", description: "x", schedule: "+30d",
+      subagent_type: "general-purpose", prompt: "x",
+    });
+
+    // A whole day of clamped 1 ms hops would be thousands of fires; one tick of
+    // the first hop must not fire at all.
+    vi.advanceTimersByTime(1);
+    expect(manager.spawn).not.toHaveBeenCalled();
+    vi.advanceTimersByTime(2_000);
+    expect(manager.spawn).not.toHaveBeenCalled();
+    expect(scheduler.list().find(j => j.id === job.id)?.enabled).toBe(true);
+    expect(scheduler.getNextRun(job.id)).toBe(new Date("2026-12-15T00:00:00Z").toISOString());
+
+    // Still armed right up to the target, and fires once at it.
+    vi.advanceTimersByTime(30 * 24 * 60 * 60 * 1000);
+    expect(manager.spawn).toHaveBeenCalledTimes(1);
+    expect(scheduler.list().find(j => j.id === job.id)?.enabled).toBe(false);
+  });
+
+  it("keeps a sub-ceiling one-shot on its original schedule", () => {
+    vi.useFakeTimers();
+    const job = scheduler.addJob({
+      name: "soon", description: "x", schedule: "+10m",
+      subagent_type: "general-purpose", prompt: "x",
+    });
+    vi.advanceTimersByTime(9 * 60 * 1000);
+    expect(manager.spawn).not.toHaveBeenCalled();
+    vi.advanceTimersByTime(62 * 1000);
+    expect(manager.spawn).toHaveBeenCalledTimes(1);
+    expect(scheduler.list().find(j => j.id === job.id)?.enabled).toBe(false);
+  });
+
+  it("refuses an interval longer than the timer ceiling instead of spinning at 1 ms", () => {
+    const job = scheduler.addJob({
+      name: "monthly", description: "x", schedule: "30d",
+      subagent_type: "general-purpose", prompt: "x",
+    });
+    const refused = scheduler.list().find(j => j.id === job.id);
+    expect(refused?.enabled).toBe(false);
+    expect(refused?.lastStatus).toBe("error");
+    expect(pi.events.emit).toHaveBeenCalledWith("subagents:scheduled", expect.objectContaining({
+      type: "error", jobId: job.id, error: expect.stringMatching(/longest supported timer/),
+    }));
+  });
+});
+
 describe("SubagentScheduler — fire path", () => {
   let tmp: string;
   let store: ScheduleStore;

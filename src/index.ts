@@ -899,11 +899,15 @@ export default function (pi: ExtensionAPI) {
             const record = resolveAgentRef(id);
             // Same guard as get_subagent_result: a running agent has no result
             // to consume, and its notification is still the caller's only
-            // signal that it finished.
+            // signal that it finished. Checked before the revision write, not
+            // only for the implicit-revision call: a caller passing a stale
+            // explicit `1` for a queued or running agent used to pass the
+            // `revision > resultRevision` test, set `resultConsumed`, and make
+            // the completion notification disappear when the agent settled.
             if (!record || record.parentAgentId) return false;
+            if (record.status === "running" || record.status === "queued") return false;
             const revision = resultRevision ?? record.resultRevision ?? 1;
             if (revision > (record.resultRevision ?? 1)) return false;
-            if (resultRevision === undefined && (record.status === "running" || record.status === "queued")) return false;
             record.consumedRevision = Math.max(record.consumedRevision ?? 0, revision);
             if (revision === (record.resultRevision ?? 1)) record.resultConsumed = true;
             cancelNudge(`${record.id}:${revision}`);
@@ -962,19 +966,18 @@ export default function (pi: ExtensionAPI) {
     if (event.source === "extension" || !isAgentMentionsEnabled()) return { action: "continue" };
     // Claiming the turn is TUI only, matching the `@` completion that teaches
     // the syntax. Pi defaults `session.prompt()` to source "interactive", so a
-    // headless `pi -p "@explore …"` reaches here too — and claiming it would
-    // answer with silence, which the background hold cannot fix: `handled`
-    // returns from prompt() before any turn starts, so the loop that patch wraps
-    // never runs (it holds subagents spawned by the Agent tool MID-turn, a
-    // different path). The agent would detach, `ctx.ui.notify` is a no-op
-    // outside the TUI, and print mode would exit having printed nothing.
-    //
-    // `model` mode has none of that problem: it queues a reminder and lets the
-    // turn run, so the answer is the model's own, printed as usual. It is the
-    // only branch allowed to act headlessly; everything else falls through to
-    // the main model exactly as it did before mentions existed.
-    const canDispatchDirectly = ctx.mode === "tui";
-    if (!canDispatchDirectly && getAgentMentionMode() !== "model") return { action: "continue" };
+    // headless `pi -p "@explore …"` reaches here too — and claiming it answers
+    // with silence: `handled` returns from prompt() before any turn starts, so
+    // print mode prints nothing, `ctx.ui.notify` is a no-op outside the TUI,
+    // and every spawn branch below is detached (the `model` branch runs an
+    // off-screen clone that awaits its own model turn). Print mode does not
+    // process.exit, so the clone outlived the prompt that started it and
+    // spawned into an already-shut-down session. The earlier claim that
+    // `model` mode was safe headless because it "queues a reminder and lets the
+    // turn run" was wrong: no branch here queues a reminder to the main model's
+    // turn. Every non-TUI mode falls through to the main model, so `@explore`
+    // reads as ordinary prose instead of disappearing.
+    if (ctx.mode !== "tui") return { action: "continue" };
 
     const mention = parseMention(event.text);
     if (!mention) return { action: "continue" };
@@ -993,11 +996,11 @@ export default function (pi: ExtensionAPI) {
     const resolved = manager.resolveMention(mention.handle)
       ?? (alias ? manager.resolveMention(alias) : undefined);
 
-    // Steering and resuming are direct in every mode, so headless they are not
-    // available at all. Falling through here rather than dropping to the start
-    // path below matters: the handle names an agent that already exists, and
-    // asking the model to start another one is not what was typed.
-    if (resolved && !canDispatchDirectly) return { action: "continue" };
+    // Non-TUI already returned above, so direct steering/resuming is always
+    // reachable here. Keep the comment as the reason the early return exists:
+    // a handle naming an existing agent must never fall through to the
+    // start-fresh path, because asking the model to start another agent is not
+    // what was typed.
 
     if (resolved?.kind === "live") {
       const record = resolved.record;
@@ -1216,6 +1219,11 @@ export default function (pi: ExtensionAPI) {
     for (const timer of pendingNudges.values()) clearTimeout(timer);
     pendingNudges.clear();
     fleet.dispose();
+    // A group waiting on a straggler holds a timer; on /new, /resume, fork, or
+    // /reload that timer would otherwise fire into the next activation and
+    // deliver a batch for agents this instance already aborted. Its dispose()
+    // had no call site before.
+    groupJoin.dispose();
     unsubHandoffKey?.();
     unsubHandoffKey = undefined;
     handoffKeyUi = undefined;
