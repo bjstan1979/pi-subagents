@@ -102,8 +102,8 @@ Agent({
 Schedule formats:
 
 - **Cron** — 6-field (`second minute hour day-of-month month day-of-week`), e.g. `"0 0 9 * * 1"` for 9am every Monday, `"0 */15 * * * *"` for every 15 minutes.
-- **Interval** — `"5m"`, `"1h"`, `"30s"`, `"2d"`. Fires repeatedly at that interval. The longest representable interval is ~24.8 days (Node's 2^31-1 ms timer ceiling); anything longer — `"30d"` included — is refused at creation with an error, so use a cron expression for a monthly-or-longer cadence.
-- **One-shot relative** — `"+10m"`, `"+2h"`, `"+1d"`. Fires once at that future time.
+- **Interval** — `"5m"`, `"1h"`, `"30s"`, `"2d"`. Fires repeatedly at that interval. A zero interval (`"0s"`) is refused. The longest representable interval is ~24.8 days (Node's 2^31-1 ms timer ceiling); anything longer — `"30d"` included — is refused at creation with an error, so use a cron expression for a monthly-or-longer cadence.
+- **One-shot relative** — `"+10m"`, `"+2h"`, `"+1d"`. Fires once at that future time; `"+0s"` is refused because it is not in the future.
 - **One-shot absolute** — full ISO timestamp, e.g. `"2026-12-25T09:00:00.000Z"`.
 
 When a schedule fires, the spawn runs in background and its completion notification arrives the same way as a manually-spawned background agent's — your parent agent reasons about the result the same way.

@@ -138,7 +138,15 @@ export class SubagentScheduler {
     };
   }
 
-  /** Add a job, persist, and arm if enabled. Returns the stored job. */
+  /**
+   * Add a job, persist, and arm if enabled. Returns the stored job.
+   *
+   * Throws — and leaves no job record behind — when the job cannot be armed. Arming
+   * failures (a timestamp that went past between parse and arm, a schedule the
+   * timer layer rejects) used to be reported only as an `error` event while the
+   * enabled record was returned, so the Agent tool answered "Scheduled …" for a
+   * job that would never run. Refusing here keeps "created" meaning "armed".
+   */
   addJob(input: NewJobInput): ScheduledSubagent {
     const store = this.requireStore();
     if (store.hasName(input.name)) {
@@ -146,9 +154,17 @@ export class SubagentScheduler {
     }
     const job = this.buildJob(input);
     store.add(job);
-    if (job.enabled) this.scheduleJob(job);
-    this.emit({ type: "added", job });
-    return job;
+    if (job.enabled) {
+      const armError = this.scheduleJob(job, { quiet: true });
+      if (armError) {
+        this.unscheduleJob(job.id);
+        store.remove(job.id);
+        throw new Error(armError);
+      }
+    }
+    const stored = store.get(job.id) ?? job;
+    this.emit({ type: "added", job: stored });
+    return stored;
   }
 
   removeJob(id: string): boolean {
@@ -167,8 +183,11 @@ export class SubagentScheduler {
     if (!updated) return undefined;
     this.unscheduleJob(id);
     if (updated.enabled) this.scheduleJob(updated);
-    this.emit({ type: "updated", job: updated });
-    return updated;
+    // Arming can disable the job again (past one-shot, over-long or zero
+    // interval). Report the state that is actually stored, not the patch.
+    const current = store.get(id) ?? updated;
+    this.emit({ type: "updated", job: current });
+    return current;
   }
 
   /** Next-run time as ISO, or undefined if not currently armed. */
@@ -190,17 +209,33 @@ export class SubagentScheduler {
 
   // ── Scheduling primitives ────────────────────────────────────────────
 
-  private scheduleJob(job: ScheduledSubagent): void {
+  /**
+   * Arm a job. Returns an error message when the job could not be armed (the
+   * record is then disabled with `lastStatus: "error"`), or undefined on success.
+   * `quiet` suppresses the `error` event for callers that surface the failure
+   * themselves (addJob throws it instead of announcing a job it then removes).
+   */
+  private scheduleJob(job: ScheduledSubagent, opts: { quiet?: boolean } = {}): string | undefined {
     const store = this.store;
-    if (!store) return;
+    if (!store) return undefined;
+    const refuse = (error: string): string => {
+      store.update(job.id, { enabled: false, lastStatus: "error" });
+      if (!opts.quiet) this.emit({ type: "error", jobId: job.id, error });
+      return error;
+    };
     try {
-      if (job.scheduleType === "interval" && job.intervalMs) {
+      if (job.scheduleType === "interval") {
+        // A zero or missing interval used to fall through to the cron branch,
+        // where `new Cron("0s")` threw: the error was emitted but the record
+        // stayed enabled forever and never ran. Treat it like the over-long
+        // case — disable and report.
+        if (!job.intervalMs || job.intervalMs <= 0) {
+          return refuse(`Interval ${job.schedule} must be greater than zero`);
+        }
         if (job.intervalMs > MAX_TIMER_DELAY_MS) {
           // An interval this long cannot be represented by setInterval; arming it
           // would spin at 1 ms. Disable and report instead of firing continuously.
-          store.update(job.id, { enabled: false, lastStatus: "error" });
-          this.emit({ type: "error", jobId: job.id, error: `Interval ${job.schedule} exceeds the longest supported timer (${MAX_TIMER_DELAY_MS} ms)` });
-          return;
+          return refuse(`Interval ${job.schedule} exceeds the longest supported timer (${MAX_TIMER_DELAY_MS} ms)`);
         }
         const t = setInterval(() => this.executeJob(job.id), job.intervalMs);
         this.intervals.set(job.id, t);
@@ -227,16 +262,18 @@ export class SubagentScheduler {
           arm(delay);
         } else {
           // Past timestamp — disable, mark error, never fire
-          store.update(job.id, { enabled: false, lastStatus: "error" });
-          this.emit({ type: "error", jobId: job.id, error: `Scheduled time ${job.schedule} is in the past` });
+          return refuse(`Scheduled time ${job.schedule} is in the past`);
         }
       } else {
         const cron = new Cron(job.schedule, () => this.executeJob(job.id));
         this.jobs.set(job.id, cron);
       }
     } catch (err) {
-      this.emit({ type: "error", jobId: job.id, error: err instanceof Error ? err.message : String(err) });
+      // A schedule the timer layer rejects can never run; leaving it enabled
+      // re-reported the same error on every start and showed it as active.
+      return refuse(err instanceof Error ? err.message : String(err));
     }
+    return undefined;
   }
 
   private unscheduleJob(id: string): void {
@@ -368,10 +405,21 @@ export class SubagentScheduler {
     const trimmed = s.trim();
     // "+10m" — relative one-shot
     const rel = SubagentScheduler.parseRelativeTime(trimmed);
-    if (rel !== null) return { type: "once", normalized: rel };
+    if (rel !== null) {
+      // "+0s" resolves to "now", which arming would immediately treat as past.
+      if (new Date(rel).getTime() <= Date.now()) {
+        throw new Error(`Relative schedule "${trimmed}" must be in the future (use at least "+1s").`);
+      }
+      return { type: "once", normalized: rel };
+    }
     // "5m" — interval
     const ivl = SubagentScheduler.parseInterval(trimmed);
-    if (ivl !== null) return { type: "interval", intervalMs: ivl, normalized: trimmed };
+    if (ivl !== null) {
+      if (ivl <= 0) {
+        throw new Error(`Interval "${trimmed}" must be greater than zero.`);
+      }
+      return { type: "interval", intervalMs: ivl, normalized: trimmed };
+    }
     // ISO timestamp — one-shot. Reject past timestamps upfront so we never
     // create a dead-on-arrival record (scheduleJob's safety net still catches
     // micro-races from `+0s`-style relatives).
@@ -415,7 +463,11 @@ export class SubagentScheduler {
     const m = s.match(/^\+(\d+)(s|m|h|d)$/);
     if (!m) return null;
     const ms = parseInt(m[1], 10) * { s: 1000, m: 60_000, h: 3_600_000, d: 86_400_000 }[m[2] as "s" | "m" | "h" | "d"];
-    return new Date(Date.now() + ms).toISOString();
+    // An absurd offset ("+99999999999d") lands outside the Date range, where
+    // toISOString() throws a bare RangeError. Report it as unparseable instead.
+    const at = new Date(Date.now() + ms);
+    if (Number.isNaN(at.getTime())) return null;
+    return at.toISOString();
   }
 
   /** "10s"/"5m"/"1h"/"2d" → milliseconds. */

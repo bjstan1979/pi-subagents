@@ -8,6 +8,8 @@
  *   - Past-timestamp rejection
  *   - Long delays: chained one-shots, and intervals past the timer ceiling
  *     refused at creation
+ *   - Zero / non-future schedules refused at creation; unarmable records on
+ *     disk disabled on reload; updateJob reports the stored state
  *   - One-shot auto-disable
  *   - Concurrency-bypass option flows through to manager.spawn
  */
@@ -342,6 +344,82 @@ describe("SubagentScheduler — long delays", () => {
     vi.advanceTimersByTime(2_000);
     expect(manager.spawn).not.toHaveBeenCalled();
     expect(scheduler.list().find(j => j.id === job.id)?.enabled).toBe(true);
+  });
+
+  // A zero interval parsed as `intervalMs: 0`, failed the truthiness test in
+  // scheduleJob and fell through to `new Cron("0s")`. That threw, the error was
+  // emitted, and the record stayed enabled forever while the Agent tool said
+  // "Scheduled … Next run: (unknown)". It must be refused like the over-long case.
+  it("rejects a zero interval before persisting anything", () => {
+    for (const schedule of ["0s", "0m", "0h", "0d"]) {
+      expect(() => scheduler.addJob({
+        name: `zero-${schedule}`, description: "x", schedule,
+        subagent_type: "general-purpose", prompt: "x",
+      })).toThrow(/greater than zero/);
+    }
+    expect(scheduler.list()).toEqual([]);
+    expect(existsSync(join(tmp, "s.json"))).toBe(false);
+    expect(pi.events.emit).not.toHaveBeenCalledWith(
+      "subagents:scheduled",
+      expect.objectContaining({ type: "added" }),
+    );
+  });
+
+  it("rejects a relative one-shot that is not in the future (+0s)", () => {
+    expect(() => scheduler.addJob({
+      name: "now", description: "x", schedule: "+0s",
+      subagent_type: "general-purpose", prompt: "x",
+    })).toThrow(/must be in the future/);
+    expect(scheduler.list()).toEqual([]);
+  });
+
+  it("reports an out-of-range relative offset as an invalid schedule, not a RangeError", () => {
+    expect(() => SubagentScheduler.detectSchedule("+99999999999d")).toThrow(/Invalid schedule/);
+    expect(SubagentScheduler.parseRelativeTime("+99999999999d")).toBeNull();
+  });
+
+  it("disables an already-persisted zero interval on reload instead of leaving it enabled", () => {
+    store.add({
+      id: "reload-zero",
+      name: "reload-zero",
+      description: "reload-zero",
+      schedule: "0s",
+      scheduleType: "interval",
+      intervalMs: 0,
+      subagent_type: "general-purpose",
+      prompt: "x",
+      enabled: true,
+      createdAt: new Date().toISOString(),
+      runCount: 0,
+    });
+    scheduler.stop();
+    scheduler.start(pi, ctx, manager, store);
+
+    const reloaded = scheduler.list().find(j => j.id === "reload-zero");
+    expect(reloaded?.enabled).toBe(false);
+    expect(reloaded?.lastStatus).toBe("error");
+    expect(pi.events.emit).toHaveBeenCalledWith("subagents:scheduled", expect.objectContaining({
+      type: "error", jobId: "reload-zero", error: expect.stringMatching(/greater than zero/),
+    }));
+  });
+
+  it("updateJob returns the stored state when re-arming disables the job", () => {
+    store.add({
+      id: "reenable-long",
+      name: "reenable-long",
+      description: "x",
+      schedule: "30d",
+      scheduleType: "interval",
+      intervalMs: 2_592_000_000,
+      subagent_type: "general-purpose",
+      prompt: "x",
+      enabled: false,
+      createdAt: new Date().toISOString(),
+      runCount: 0,
+    });
+    const updated = scheduler.updateJob("reenable-long", { enabled: true });
+    expect(updated?.enabled).toBe(false);
+    expect(updated?.lastStatus).toBe("error");
   });
 
   // Jobs already on disk (written by an older version) can still carry an
